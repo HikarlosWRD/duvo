@@ -1,7 +1,7 @@
 From db515c17737dd14bff3b23aab1473c9f714cbd80 Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Tue, 17 Nov 2026 20:48:32 -0300
-Subject: [PATCH 01/30] fix(build): OpenSSL 4 compat and missing cfg.profile
+Subject: [PATCH 01/31] fix(build): OpenSSL 4 compat and missing cfg.profile
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

@@ -1,7 +1,7 @@
 From 9e331bb0d9669d418e491ab28d96b8d4179c2457 Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 07:14:38 -0300
-Subject: [PATCH 06/30] fix(orbit): keep upstream tray menu indices (pair item
+Subject: [PATCH 06/31] fix(orbit): keep upstream tray menu indices (pair item
  after force-stop)
 
 update_tray_playing/stopped write tray.menu[2]; inserting the Orbit item at

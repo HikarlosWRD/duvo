@@ -1,7 +1,7 @@
 From 6e83aafc14c6a1aaf91da577d1b7aace17972074 Mon Sep 17 00:00:00 2001
 From: Duvo <duvo@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 17:31:44 -0300
-Subject: [PATCH 28/30] refactor: protocol identifiers Orbit -> Duvo (duvo://,
+Subject: [PATCH 28/31] refactor: protocol identifiers Orbit -> Duvo (duvo://,
  _duvo._tcp, /duvo/ API, /api/duvo/)
 
 ---

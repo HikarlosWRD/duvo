@@ -1,7 +1,7 @@
 From f6504e2cacbfc4ece66d6241999041ffbacd6792 Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 12:44:11 -0300
-Subject: [PATCH 10/30] feat(host): enable input-only mode by default
+Subject: [PATCH 10/31] feat(host): enable input-only mode by default
 
 The Orbit phone remote control uses Apollo's input-only session
 (appuuid REMOTE_INPUT_UUID), which nvhttp only honours with

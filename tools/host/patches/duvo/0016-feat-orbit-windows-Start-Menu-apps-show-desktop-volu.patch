@@ -1,7 +1,7 @@
 From f78f97f8ab69b90a1a978ce2b098f1a0e0c0dbb6 Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 18:20:31 -0300
-Subject: [PATCH 16/30] feat(orbit): windows, Start Menu apps, show desktop,
+Subject: [PATCH 16/31] feat(orbit): windows, Start Menu apps, show desktop,
  volume and power API
 
 New mTLS routes: GET /orbit/windows, POST /orbit/windows/activate?id=

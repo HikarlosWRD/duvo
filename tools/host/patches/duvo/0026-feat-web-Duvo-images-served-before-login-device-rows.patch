@@ -1,7 +1,7 @@
 From ea2f417ab4fec3938921c8739125a58159df5d4f Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 14:39:01 -0300
-Subject: [PATCH 26/30] feat(web): Duvo images served before login, device rows
+Subject: [PATCH 26/31] feat(web): Duvo images served before login, device rows
  with access levels, auto refresh
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

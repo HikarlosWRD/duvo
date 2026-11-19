@@ -1,7 +1,7 @@
 From ec5a7996e87743ba94a7e1e8ebe1da6535c5328d Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 07:14:59 -0300
-Subject: [PATCH 07/30] refactor(orbit): drop unused, unlocked OtpSlot::clear()
+Subject: [PATCH 07/31] refactor(orbit): drop unused, unlocked OtpSlot::clear()
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

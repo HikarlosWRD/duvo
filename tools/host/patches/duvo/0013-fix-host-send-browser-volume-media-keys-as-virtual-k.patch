@@ -1,7 +1,7 @@
 From a50e2269d870a00d0865f0d055e1e2cb2dfa540f Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 17:35:05 -0300
-Subject: [PATCH 13/30] fix(host): send browser/volume/media keys as virtual
+Subject: [PATCH 13/31] fix(host): send browser/volume/media keys as virtual
  keys, not scan codes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

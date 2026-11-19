@@ -1,7 +1,7 @@
 From 033b6fe1ec70f7ecb838b8c3223615c7dbe9b6b7 Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 06:51:39 -0300
-Subject: [PATCH 05/30] feat(orbit): QR/OTP-paired clients get launch + input
+Subject: [PATCH 05/31] feat(orbit): QR/OTP-paired clients get launch + input
  permissions
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From c66058bc66cf6439cc029c938a3b084063676fbe Mon Sep 17 00:00:00 2001
 From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 17:10:57 -0300
-Subject: [PATCH 27/30] feat(web): phone-on-PC card redesigned
+Subject: [PATCH 27/31] feat(web): phone-on-PC card redesigned
  (add/open/close/rotate/remove, plain-language errors, auto refresh); rotate
  and disconnect endpoints; window title Duvo
 

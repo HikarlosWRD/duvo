@@ -1,7 +1,7 @@
 From 70e45dfdecd69fc6c7fa73edec9a43cbaffad992 Mon Sep 17 00:00:00 2001
 From: Duvo <duvo@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 17:49:37 -0300
-Subject: [PATCH 29/30] fix: include paths after the identifier rename
+Subject: [PATCH 29/31] fix: include paths after the identifier rename
 
 ---
  src/config.cpp     | 2 +-

@@ -1,0 +1,52 @@
+From d3acb46bde9b7b42d6b4dbf57eb4d6c59e728594 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:00:54 -0300
+Subject: [PATCH 31/31] fix(web): sidebar links follow the theme (were black on
+ dark)
+
+---
+ src_assets/common/assets/web/Navbar.vue                 | 6 +++---
+ src_assets/common/assets/web/public/assets/css/duvo.css | 6 ++++++
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src_assets/common/assets/web/Navbar.vue b/src_assets/common/assets/web/Navbar.vue
+index c1ae409b..4cc09377 100644
+--- a/src_assets/common/assets/web/Navbar.vue
++++ b/src_assets/common/assets/web/Navbar.vue
+@@ -56,16 +56,16 @@ export default {
+ }
+ 
+ .header .nav-link {
+-  color: rgba(0, 0, 0, .65) !important;
++  color: var(--bs-secondary-color) !important;
+ }
+ 
+ .header .nav-link.active {
+-  color: rgb(0, 0, 0) !important;
++  color: var(--bs-body-color) !important;
+   font-weight: 500;
+ }
+ 
+ .header .nav-link:hover {
+-  color: rgb(0, 0, 0) !important;
++  color: var(--bs-body-color) !important;
+   font-weight: 500;
+ }
+ 
+diff --git a/src_assets/common/assets/web/public/assets/css/duvo.css b/src_assets/common/assets/web/public/assets/css/duvo.css
+index cb9f9b2d..98f52642 100644
+--- a/src_assets/common/assets/web/public/assets/css/duvo.css
++++ b/src_assets/common/assets/web/public/assets/css/duvo.css
+@@ -162,3 +162,9 @@ html .duvo-rev-empty { padding: 18px 0 4px; }
+ html .duvo-rev-error { margin-top: 16px; margin-bottom: 0; }
+ html .duvo-rev-add { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--bs-border-color); }
+ html .duvo-rev-step { margin-bottom: 18px; }
++
++/* The sidebar links must follow the theme: Apollo's navbar forces black text with !important (invisible on dark). */
++html .header .nav-link { color: var(--bs-secondary-color) !important; }
++html .header .nav-link:hover, html .header .nav-link.active { color: var(--bs-body-color) !important; }
++html .header .navbar-toggler { color: var(--bs-body-color) !important; border-color: var(--bs-border-color) !important; }
++html .navbar-background { background-color: var(--bs-body-bg) !important; }
+-- 
+2.55.0.windows.5
+
