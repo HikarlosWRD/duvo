@@ -1,0 +1,256 @@
+From c8f2bcabb4d43265b41b1aae18fa8be856b10192 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:44:10 -0300
+Subject: [PATCH 14/28] feat(orbit): window/power permissions, Controle preset,
+ migration
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/crypto.h                                  |  4 +-
+ src/nvhttp.cpp                                | 14 +++++++
+ src/orbit/client_perm.cpp                     |  8 ++++
+ src/orbit/client_perm.h                       | 20 +++++++++-
+ src_assets/common/assets/web/pin.html         | 18 +++++++--
+ .../assets/web/public/assets/locale/en.json   |  2 +
+ .../web/public/assets/locale/pt_BR.json       |  2 +
+ tests/unit/test_client_perm.cpp               | 38 ++++++++++++++++++-
+ 8 files changed, 98 insertions(+), 8 deletions(-)
+
+diff --git a/src/crypto.h b/src/crypto.h
+index 350bb5cc..f1fd6544 100644
+--- a/src/crypto.h
++++ b/src/crypto.h
+@@ -59,7 +59,9 @@ namespace crypto {
+     file_upload      = _operation << 2,  // Allow upload files to host
+     file_dwnload     = _operation << 3,  // Allow download files from host
+     server_cmd       = _operation << 4,  // Allow execute server cmd
+-    _all_opeiations  = clipboard_set | clipboard_read | file_upload | file_dwnload | server_cmd,
++    orbit_windows    = _operation << 5,  // ORBIT: Allow window/app management from the remote-control client
++    orbit_power      = _operation << 6,  // ORBIT: Allow power actions (sleep/lock/shutdown) from the client
++    _all_opeiations  = clipboard_set | clipboard_read | file_upload | file_dwnload | server_cmd | orbit_windows | orbit_power,  // ORBIT: includes the new bits
+ 
+     _action          = _operation << 8,  // Action permission group
+     list             = _action << 0,     // Allow list apps
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index dd5a230c..f9787879 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -315,6 +315,7 @@ namespace nvhttp {
+ 
+     nlohmann::json root = tree["root"];
+     client_t client;  // Local client to load into
++    bool perm_migrated = false;  // ORBIT: set when a stored perm was migrated
+ 
+     // Import from the old format if available.
+     if (root.contains("devices")) {
+@@ -346,6 +347,14 @@ namespace nvhttp {
+         named_cert_p->uuid = el.value("uuid", "");
+         named_cert_p->display_mode = el.value("display_mode", "");
+         named_cert_p->perm = (PERM)(util::get_non_string_json_value<uint32_t>(el, "perm", (uint32_t)PERM::_all)) & PERM::_all;
++        // ORBIT: migrate the old QR preset to "Controle"; persisted below
++        {
++          auto migrated = orbit::migrate_perm(named_cert_p->perm);
++          if (migrated != named_cert_p->perm) {
++            named_cert_p->perm = migrated;
++            perm_migrated = true;
++          }
++        }
+         named_cert_p->enable_legacy_ordering = el.value("enable_legacy_ordering", true);
+         named_cert_p->allow_client_commands = el.value("allow_client_commands", true);
+         named_cert_p->always_use_virtual_display = el.value("always_use_virtual_display", false);
+@@ -363,6 +372,11 @@ namespace nvhttp {
+     }
+ 
+     client_root = client;
++
++    // ORBIT: write migrated permissions back so the migration runs once
++    if (perm_migrated && !config::sunshine.flags[config::flag::FRESH_STATE]) {
++      save_state();
++    }
+   }
+ 
+   void add_authorized_client(const p_named_cert_t& named_cert_p) {
+diff --git a/src/orbit/client_perm.cpp b/src/orbit/client_perm.cpp
+index 67f47bf6..5aa8ab8c 100644
+--- a/src/orbit/client_perm.cpp
++++ b/src/orbit/client_perm.cpp
+@@ -28,4 +28,12 @@ namespace orbit {
+     }
+     return is_first_client ? crypto::PERM::_all : crypto::PERM::_default;
+   }
++
++  crypto::PERM migrate_perm(crypto::PERM stored) {
++    return static_cast<uint32_t>(stored) == kLegacyQrPairedPerm ? kQrPairedPerm : stored;
++  }
++
++  bool has_perm(const crypto::named_cert_t *cert, crypto::PERM perm) {
++    return cert != nullptr && !!(cert->perm & perm);
++  }
+ }  // namespace orbit
+diff --git a/src/orbit/client_perm.h b/src/orbit/client_perm.h
+index 7778179a..46e63fbc 100644
+--- a/src/orbit/client_perm.h
++++ b/src/orbit/client_perm.h
+@@ -24,12 +24,28 @@
+ #include "src/crypto.h"
+ 
+ namespace orbit {
++  /// Permission bits of the pre-M2 QR preset (list|view|launch|all inputs).
++  inline constexpr uint32_t kLegacyQrPairedPerm = 0x07001F00u;
++
+   /**
+-   * @brief Permissions for clients paired through the QR/OTP flow (no clipboard, files or server commands).
++   * @brief "Controle" preset for QR/OTP-paired clients: apps, inputs, clipboard, window and power control
++   * (no file transfer or server commands).
+    */
+   inline constexpr crypto::PERM kQrPairedPerm = static_cast<crypto::PERM>(
+     static_cast<uint32_t>(crypto::PERM::list) | static_cast<uint32_t>(crypto::PERM::view) | static_cast<uint32_t>(crypto::PERM::launch) |
+-    static_cast<uint32_t>(crypto::PERM::_all_inputs));
++    static_cast<uint32_t>(crypto::PERM::_all_inputs) | static_cast<uint32_t>(crypto::PERM::clipboard_set) |
++    static_cast<uint32_t>(crypto::PERM::clipboard_read) | static_cast<uint32_t>(crypto::PERM::orbit_windows) |
++    static_cast<uint32_t>(crypto::PERM::orbit_power));
++
++  /**
++   * @brief Migrate a stored permission: the old QR preset becomes the "Controle" preset; anything else is unchanged.
++   */
++  crypto::PERM migrate_perm(crypto::PERM stored);
++
++  /**
++   * @brief True when the client is known and holds the given permission bit(s).
++   */
++  bool has_perm(const crypto::named_cert_t *cert, crypto::PERM perm);
+ 
+   /**
+    * @brief Pick the permission for a newly paired client.
+diff --git a/src_assets/common/assets/web/pin.html b/src_assets/common/assets/web/pin.html
+index 5882664a..de3014ba 100644
+--- a/src_assets/common/assets/web/pin.html
++++ b/src_assets/common/assets/web/pin.html
+@@ -277,7 +277,9 @@
+       file_upload      = _operation << 2,  // Allow upload files to host
+       file_dwnload     = _operation << 3,  // Allow download files from host
+       server_cmd       = _operation << 4,  // Allow execute server cmd
+-      _all_opeiations  = clipboard_set | clipboard_read | file_upload | file_dwnload | server_cmd,
++      orbit_windows    = _operation << 5,  // ORBIT
++      orbit_power      = _operation << 6,  // ORBIT
++      _all_opeiations  = clipboard_set | clipboard_read | file_upload | file_dwnload | server_cmd | orbit_windows | orbit_power,
+ 
+       _action          = _operation << 8,  // Action permission group
+       list             = _action << 0,     // Allow list apps
+@@ -307,7 +309,9 @@
+     file_upload: 0x00040000,
+     file_dwnload: 0x00080000,
+     server_cmd: 0x00100000,
+-    _all_operations: 0x001F0000,
++    orbit_windows: 0x00200000, // ORBIT
++    orbit_power: 0x00400000, // ORBIT
++    _all_operations: 0x007F0000,
+ 
+     // Action permission group
+     list: 0x01000000,
+@@ -319,7 +323,7 @@
+     // Special permissions
+     _default: 0x03000000,
+     _no: 0x00000000,
+-    _all: 0x071F1F00
++    _all: 0x077F1F00
+   };
+ 
+   const permissionGroups = [
+@@ -347,6 +351,14 @@
+       {
+         name: 'server_cmd',
+         suppressed_by: []
++      },
++      {
++        name: 'orbit_windows', // ORBIT
++        suppressed_by: []
++      },
++      {
++        name: 'orbit_power', // ORBIT
++        suppressed_by: []
+       }
+     ] },
+     { name: 'Input', permissions: [
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index 71406ab8..a22a374a 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -510,6 +510,8 @@
+     "file_upload": "File Upload",
+     "file_dwnload": "File Download",
+     "server_cmd": "Server Command",
++    "orbit_windows": "Windows & apps",
++    "orbit_power": "Power",
+     "list": "List Apps",
+     "view": "View Streams",
+     "launch": "Launch Apps"
+diff --git a/src_assets/common/assets/web/public/assets/locale/pt_BR.json b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+index ab04d6b8..8c3dd827 100644
+--- a/src_assets/common/assets/web/public/assets/locale/pt_BR.json
++++ b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+@@ -470,6 +470,8 @@
+     "file_upload": "Upload de arquivos",
+     "file_dwnload": "Download de arquivos",
+     "server_cmd": "Comandos de servidor",
++    "orbit_windows": "Janelas e apps",
++    "orbit_power": "Energia",
+     "list": "Lista de aplicativos",
+     "view": "Ver transmissões",
+     "launch": "Iniciar aplicativos"
+diff --git a/tests/unit/test_client_perm.cpp b/tests/unit/test_client_perm.cpp
+index 5f888636..2a4702de 100644
+--- a/tests/unit/test_client_perm.cpp
++++ b/tests/unit/test_client_perm.cpp
+@@ -37,8 +37,8 @@ TEST(ClientPerm, OtpGetsQrPermsEvenIfFirst) {
+   }
+ }
+ 
+-TEST(ClientPerm, OtpPermsExcludeServerCmdFilesClipboard) {
+-  for (auto p : {PERM::server_cmd, PERM::file_upload, PERM::file_dwnload, PERM::clipboard_read, PERM::clipboard_set}) {
++TEST(ClientPerm, OtpPermsExcludeServerCmdAndFiles) {
++  for (auto p : {PERM::server_cmd, PERM::file_upload, PERM::file_dwnload}) {
+     EXPECT_FALSE(has(orbit::kQrPairedPerm, p));
+   }
+ }
+@@ -50,3 +50,37 @@ TEST(ClientPerm, PinPairingFirstGetsAll) {
+ TEST(ClientPerm, PinPairingLaterGetsDefault) {
+   EXPECT_EQ(orbit::perm_for_new_client(false, false), PERM::_default);
+ }
++
++TEST(ClientPerm, ControlePresetBits) {
++  for (auto p : {PERM::orbit_windows, PERM::orbit_power, PERM::clipboard_set, PERM::clipboard_read}) {
++    EXPECT_TRUE(has(orbit::kQrPairedPerm, p));
++  }
++  for (auto p : {PERM::file_upload, PERM::file_dwnload, PERM::server_cmd}) {
++    EXPECT_FALSE(has(orbit::kQrPairedPerm, p));
++  }
++}
++
++TEST(ClientPerm, MigratesOldQrPreset) {
++  EXPECT_EQ(orbit::migrate_perm(static_cast<PERM>(0x07001F00u)), orbit::kQrPairedPerm);
++}
++
++TEST(ClientPerm, KeepsOtherPermsAsIs) {
++  EXPECT_EQ(orbit::migrate_perm(PERM::_default), PERM::_default);
++  EXPECT_EQ(orbit::migrate_perm(PERM::_all), PERM::_all);
++  EXPECT_EQ(orbit::migrate_perm(orbit::kQrPairedPerm), orbit::kQrPairedPerm);
++}
++
++TEST(ClientPerm, NewBitsDoNotCollide) {
++  EXPECT_EQ(static_cast<uint32_t>(PERM::orbit_windows), 1u << 21);
++  EXPECT_EQ(static_cast<uint32_t>(PERM::orbit_power), 1u << 22);
++  EXPECT_TRUE(has(PERM::_all, PERM::orbit_windows));
++  EXPECT_TRUE(has(PERM::_all, PERM::orbit_power));
++}
++
++TEST(ClientPerm, HasPermNullAndSet) {
++  EXPECT_FALSE(orbit::has_perm(nullptr, PERM::orbit_power));
++  crypto::named_cert_t c;
++  c.perm = orbit::kQrPairedPerm;
++  EXPECT_TRUE(orbit::has_perm(&c, PERM::orbit_power));
++  EXPECT_FALSE(orbit::has_perm(&c, PERM::server_cmd));
++}
+-- 
+2.55.0.windows.5
+

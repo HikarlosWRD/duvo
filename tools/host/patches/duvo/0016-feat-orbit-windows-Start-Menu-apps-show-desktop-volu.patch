@@ -1,0 +1,1488 @@
+From f78f97f8ab69b90a1a978ce2b098f1a0e0c0dbb6 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:20:31 -0300
+Subject: [PATCH 16/28] feat(orbit): windows, Start Menu apps, show desktop,
+ volume and power API
+
+New mTLS routes: GET /orbit/windows, POST /orbit/windows/activate?id=
+(404 not_found, 409 denied), POST /orbit/desktop, GET /orbit/apps,
+POST /orbit/apps/launch?id= (orbit_windows); POST /orbit/power?action=
+shutdown|restart|sleep|logoff|lock (orbit_power, 400 on unknown action,
+logs "[Orbit] power <action> pedido por <device>"); POST /orbit/volume
+?level=0..100 (clamped) and/or mute=0|1 (input_kbd).
+
+Platform calls sit behind WindowPlatform/PowerPlatform (fakes in tests).
+Windows side: visible titled top-level windows (no tool windows, cloaked
+or host-owned windows), activate restores then SetForegroundWindow with an
+empty-mouse-input retry, refusing higher-integrity targets; ToggleDesktop
+with Win+D fallback; .lnk shortcuts from the common and the logged-in
+user's Start Menu (user token when SYSTEM), opened via explorer.exe through
+platf::run_command (runs as the user); Core Audio volume; shutdown/restart
+via InitiateSystemShutdownExW (apps not forced), sleep via SetSuspendState
+(deferred), logoff via ExitWindowsEx/WTSLogoffSession, lock via
+LockWorkStation (rundll32 as the user when SYSTEM).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake  |   5 +
+ cmake/compile_definitions/windows.cmake |   1 +
+ src/nvhttp.cpp                          |   2 +-
+ src/orbit/api_reply.h                   |  42 +++
+ src/orbit/api_routes.cpp                |  16 +-
+ src/orbit/api_routes.h                  |  67 +++-
+ src/orbit/platform_windows_win.cpp      | 448 ++++++++++++++++++++++++
+ src/orbit/power_api.cpp                 |  85 +++++
+ src/orbit/power_api.h                   |  62 ++++
+ src/orbit/windows_api.cpp               | 172 +++++++++
+ src/orbit/windows_api.h                 |  90 +++++
+ tests/unit/test_power_api.cpp           |  97 +++++
+ tests/unit/test_windows_api.cpp         | 207 +++++++++++
+ 13 files changed, 1283 insertions(+), 11 deletions(-)
+ create mode 100644 src/orbit/api_reply.h
+ create mode 100644 src/orbit/platform_windows_win.cpp
+ create mode 100644 src/orbit/power_api.cpp
+ create mode 100644 src/orbit/power_api.h
+ create mode 100644 src/orbit/windows_api.cpp
+ create mode 100644 src/orbit/windows_api.h
+ create mode 100644 tests/unit/test_power_api.cpp
+ create mode 100644 tests/unit/test_windows_api.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 03daba23..3f2938bc 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -120,6 +120,11 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/status_tracker.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/api_routes.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/api_routes.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/api_reply.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/windows_api.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/windows_api.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/power_api.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/power_api.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/cmake/compile_definitions/windows.cmake b/cmake/compile_definitions/windows.cmake
+index ab06f309..e38c7dc4 100644
+--- a/cmake/compile_definitions/windows.cmake
++++ b/cmake/compile_definitions/windows.cmake
+@@ -64,6 +64,7 @@ set(PLATFORM_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.h"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/platform_status_win.cpp"  # ORBIT: status source (foreground window, volume, SMTC)
++        "${CMAKE_SOURCE_DIR}/src/orbit/platform_windows_win.cpp"  # ORBIT: windows/apps/desktop/volume/power
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda-ioctl.h"
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda.h"
+         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index 77699f46..4ef4b747 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -1735,7 +1735,7 @@ namespace nvhttp {
+     https_server.resource["^/cancel$"]["GET"] = cancel;
+     https_server.resource["^/actions/clipboard$"]["GET"] = getClipboard;
+     https_server.resource["^/actions/clipboard$"]["POST"] = setClipboard;
+-    auto orbit_api = orbit::register_api(https_server);  // ORBIT: /orbit/status, /orbit/events (HTTPS only)
++    auto orbit_api = orbit::register_api(https_server);  // ORBIT: /orbit/* API (HTTPS only)
+ 
+     https_server.config.reuse_address = true;
+     https_server.config.address = net::af_to_any_address_string(address_family);
+diff --git a/src/orbit/api_reply.h b/src/orbit/api_reply.h
+new file mode 100644
+index 00000000..7ff95e0e
+--- /dev/null
++++ b/src/orbit/api_reply.h
+@@ -0,0 +1,42 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/api_reply.h
++ * @brief Shared reply type and permission check for the Orbit HTTPS API handlers.
++ */
++#pragma once
++
++#include "src/crypto.h"
++
++#include <map>
++#include <string>
++
++namespace orbit {
++  struct ApiReply {
++    int status;  ///< HTTP status code
++    std::string body;  ///< JSON (may be empty for errors)
++  };
++
++  using Query = std::map<std::string, std::string>;
++
++  /// 0 when the client is known and holds `perm`; 401 for an unknown client; 403 without the bit.
++  int perm_error(const crypto::named_cert_t *cert, crypto::PERM perm);
++
++  /// {"error": code} reply.
++  ApiReply error_reply(int status, const std::string &code);
++}  // namespace orbit
+diff --git a/src/orbit/api_routes.cpp b/src/orbit/api_routes.cpp
+index e60fac58..152ca1ea 100644
+--- a/src/orbit/api_routes.cpp
++++ b/src/orbit/api_routes.cpp
+@@ -32,10 +32,7 @@ namespace orbit {
+   namespace {
+     /// 0 = allowed, else the HTTP status to answer with.
+     int check_view(const crypto::named_cert_t *cert) {
+-      if (cert == nullptr) {
+-        return 401;
+-      }
+-      return has_perm(cert, crypto::PERM::view) ? 0 : 403;
++      return perm_error(cert, crypto::PERM::view);
+     }
+ 
+     bool parse_u64(const std::string &s, uint64_t &out) {
+@@ -47,6 +44,17 @@ namespace orbit {
+     }
+   }  // namespace
+ 
++  int perm_error(const crypto::named_cert_t *cert, crypto::PERM perm) {
++    if (cert == nullptr) {
++      return 401;
++    }
++    return has_perm(cert, perm) ? 0 : 403;
++  }
++
++  ApiReply error_reply(int status, const std::string &code) {
++    return {status, nlohmann::json {{"error", code}}.dump()};
++  }
++
+   std::string status_json(const Status &s) {
+     nlohmann::json j;
+     j["seq"] = s.seq;
+diff --git a/src/orbit/api_routes.h b/src/orbit/api_routes.h
+index 81d46d49..4b3043c1 100644
+--- a/src/orbit/api_routes.h
++++ b/src/orbit/api_routes.h
+@@ -21,8 +21,11 @@
+  */
+ #pragma once
+ 
++#include "api_reply.h"
++#include "power_api.h"
+ #include "src/crypto.h"
+ #include "status_tracker.h"
++#include "windows_api.h"
+ 
+ #include <chrono>
+ #include <map>
+@@ -34,11 +37,6 @@ namespace orbit {
+   /// Long-poll timeout cap (spec §10.6).
+   inline constexpr std::chrono::seconds kMaxEventsTimeout {25};
+ 
+-  struct ApiReply {
+-    int status;  ///< HTTP status code
+-    std::string body;  ///< JSON (empty for errors)
+-  };
+-
+   /// JSON for a status: {seq, activeApp, windowTitle, media:{title,artist,app,playing}, volume:{level,muted}}.
+   std::string status_json(const Status &s);
+ 
+@@ -54,9 +52,11 @@ namespace orbit {
+   /// GET /orbit/events?since=&timeout=: validate permission and parameters (timeout clamped to 25 s).
+   EventsRequest parse_events_request(const crypto::named_cert_t *cert, const std::map<std::string, std::string> &query);
+ 
+-  /// Keeps the tracker alive for the server's lifetime; destroying it stops polling and answers pending waits.
++  /// Keeps the tracker and platforms alive for the server's lifetime; destroying it stops polling and answers pending waits.
+   struct ApiHandle {
+     std::shared_ptr<StatusTracker> tracker;
++    std::shared_ptr<WindowPlatform> windows;
++    std::shared_ptr<PowerPlatform> power;
+ 
+     ~ApiHandle() {
+       if (tracker) {
+@@ -65,6 +65,34 @@ namespace orbit {
+     }
+   };
+ 
++  namespace detail {
++    template<class Response>
++    void write_reply(Response &response, const ApiReply &reply) {
++      if (reply.body.empty()) {
++        response->write(static_cast<SimpleWeb::StatusCode>(reply.status));
++      } else {
++        response->write(static_cast<SimpleWeb::StatusCode>(reply.status), reply.body, {{"Content-Type", "application/json"}});
++      }
++      if (reply.status != 200) {
++        response->close_connection_after_response = true;
++      }
++    }
++
++    template<class Request>
++    Query query_of(Request &request) {
++      Query query;
++      for (auto &[k, v] : request->parse_query_string()) {
++        query[k] = v;
++      }
++      return query;
++    }
++
++    template<class Request>
++    const crypto::named_cert_t *cert_of(Request &request) {
++      return static_cast<const crypto::named_cert_t *>(request->userp.get());
++    }
++  }  // namespace detail
++
+   /**
+    * @brief Register the /orbit/ routes on the nvhttp HTTPS (mTLS) server. Never call this for the plain HTTP server.
+    * The verified client is in request->userp (set by the server's certificate check).
+@@ -106,6 +134,33 @@ namespace orbit {
+       }, cert->uuid);
+     };
+ 
++    handle->windows = make_platform_windows();
++    handle->power = make_platform_power();
++    auto windows = handle->windows;
++    auto power = handle->power;
++
++    server.resource["^/orbit/windows$"]["GET"] = [windows](auto response, auto request) {
++      detail::write_reply(response, windows_list_reply(detail::cert_of(request), *windows));
++    };
++    server.resource["^/orbit/windows/activate$"]["POST"] = [windows](auto response, auto request) {
++      detail::write_reply(response, window_activate_reply(detail::cert_of(request), *windows, detail::query_of(request)));
++    };
++    server.resource["^/orbit/desktop$"]["POST"] = [windows](auto response, auto request) {
++      detail::write_reply(response, desktop_reply(detail::cert_of(request), *windows));
++    };
++    server.resource["^/orbit/apps$"]["GET"] = [windows](auto response, auto request) {
++      detail::write_reply(response, apps_list_reply(detail::cert_of(request), *windows));
++    };
++    server.resource["^/orbit/apps/launch$"]["POST"] = [windows](auto response, auto request) {
++      detail::write_reply(response, app_launch_reply(detail::cert_of(request), *windows, detail::query_of(request)));
++    };
++    server.resource["^/orbit/volume$"]["POST"] = [windows](auto response, auto request) {
++      detail::write_reply(response, volume_reply(detail::cert_of(request), *windows, detail::query_of(request)));
++    };
++    server.resource["^/orbit/power$"]["POST"] = [power](auto response, auto request) {
++      detail::write_reply(response, power_reply(detail::cert_of(request), *power, detail::query_of(request)));
++    };
++
+     return handle;
+   }
+ }  // namespace orbit
+diff --git a/src/orbit/platform_windows_win.cpp b/src/orbit/platform_windows_win.cpp
+new file mode 100644
+index 00000000..e85e57c3
+--- /dev/null
++++ b/src/orbit/platform_windows_win.cpp
+@@ -0,0 +1,448 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/platform_windows_win.cpp
++ * @brief Windows WindowPlatform (windows, Start Menu, show desktop, volume) and PowerPlatform.
++ *
++ * User context: the host may run as SYSTEM inside the user's session (Apollo service) or as the user.
++ * - Window list/activate/show desktop run on a short-lived thread attached to the input desktop
++ *   (platf::syncThreadDesktop, as Apollo's input code does), so they work in both cases.
++ * - Start Menu: the all-users folder plus the logged-in user's folder (resolved with the user's token when
++ *   running as SYSTEM). Shortcuts are opened with `explorer.exe "<lnk>"` through platf::run_command, which
++ *   already starts processes as the logged-in user when the host is SYSTEM. No extra helper is needed.
++ * - Lock as SYSTEM: `rundll32.exe user32.dll,LockWorkStation` via the same run_command path
++ *   (LockWorkStation only works from the user's interactive session). Logoff as SYSTEM: WTSLogoffSession.
++ * Nothing here throws; failures are logged and reported as false / denied.
++ */
++#define BOOST_PROCESS_VERSION 1
++#include "power_api.h"
++#include "windows_api.h"
++
++#include <boost/filesystem.hpp>
++#include <boost/process/v1/child.hpp>
++#include <boost/process/v1/environment.hpp>
++
++// clang-format off
++#include <WinSock2.h>
++#include <Windows.h>
++#include <dwmapi.h>
++#include <endpointvolume.h>
++#include <mmdeviceapi.h>
++#include <shldisp.h>
++#include <ShlObj.h>
++#include <WtsApi32.h>
++// clang-format on
++
++#include "src/logging.h"
++#include "src/platform/common.h"
++#include "src/platform/windows/misc.h"
++
++#include <algorithm>
++#include <chrono>
++#include <filesystem>
++#include <functional>
++#include <system_error>
++#include <thread>
++
++using namespace std::literals;
++
++namespace platf {
++  // Defined in src/platform/windows/misc.cpp (not exported by a header).
++  HANDLE retrieve_users_token(bool elevated);
++  bool is_running_as_system();
++}  // namespace platf
++
++namespace orbit {
++  namespace {
++    // shldisp.h declares these GUIDs without a definition in the import libraries we link.
++    const CLSID kClsidShell = {0x13709620, 0xc279, 0x11ce, {0xa4, 0x9e, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
++    const IID kIidShellDispatch4 = {0xefd84b2d, 0x4bcf, 0x4298, {0xbe, 0x25, 0xeb, 0x54, 0x2a, 0x59, 0xfb, 0xda}};
++
++    /// Run fn on a fresh thread bound to the input desktop (keeps the HTTP thread's desktop/COM state untouched).
++    template<class T>
++    T on_input_desktop(std::function<T()> fn) {
++      T result {};
++      std::thread t([&]() {
++        platf::syncThreadDesktop();
++        result = fn();
++      });
++      t.join();
++      return result;
++    }
++
++    std::string process_name(DWORD pid) {
++      HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++      if (proc == nullptr) {
++        return {};
++      }
++      wchar_t path[MAX_PATH * 2];
++      DWORD size = static_cast<DWORD>(std::size(path));
++      std::string out;
++      if (QueryFullProcessImageNameW(proc, 0, path, &size) && size > 0) {
++        std::wstring_view full {path, size};
++        auto slash = full.find_last_of(L"\\/");
++        out = platf::to_utf8(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
++      }
++      CloseHandle(proc);
++      return out;
++    }
++
++    /// Mandatory integrity level RID of a process token, or -1 when it can't be read.
++    long integrity_of_process(HANDLE proc) {
++      HANDLE token = nullptr;
++      if (!OpenProcessToken(proc, TOKEN_QUERY, &token)) {
++        return -1;
++      }
++      long rid = -1;
++      DWORD size = 0;
++      GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &size);
++      if (size > 0) {
++        std::vector<BYTE> buf(size);
++        if (GetTokenInformation(token, TokenIntegrityLevel, buf.data(), size, &size)) {
++          auto label = reinterpret_cast<TOKEN_MANDATORY_LABEL *>(buf.data());
++          auto count = *GetSidSubAuthorityCount(label->Label.Sid);
++          if (count > 0) {
++            rid = static_cast<long>(*GetSidSubAuthority(label->Label.Sid, count - 1));
++          }
++        }
++      }
++      CloseHandle(token);
++      return rid;
++    }
++
++    /// True when the window's process runs at a higher integrity level than the host (e.g. elevated admin app).
++    bool higher_integrity(HWND hwnd) {
++      DWORD pid = 0;
++      GetWindowThreadProcessId(hwnd, &pid);
++      HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++      if (proc == nullptr) {
++        // Can't even query it: treat as protected.
++        return true;
++      }
++      long target = integrity_of_process(proc);
++      CloseHandle(proc);
++      long self = integrity_of_process(GetCurrentProcess());
++      // Unknown target level: let SetForegroundWindow decide.
++      return target >= 0 && self >= 0 && target > self;
++    }
++
++    bool is_shell_desktop_window(HWND hwnd) {
++      wchar_t cls[64];
++      int n = GetClassNameW(hwnd, cls, static_cast<int>(std::size(cls)));
++      std::wstring_view c {cls, static_cast<size_t>(n > 0 ? n : 0)};
++      return c == L"Progman" || c == L"WorkerW";
++    }
++
++    struct EnumCtx {
++      std::vector<WindowInfo> out;
++      DWORD self;
++    };
++
++    BOOL CALLBACK enum_window(HWND hwnd, LPARAM lp) {
++      auto ctx = reinterpret_cast<EnumCtx *>(lp);
++      if (!IsWindowVisible(hwnd)) {
++        return TRUE;
++      }
++      if (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
++        return TRUE;
++      }
++      DWORD cloaked = 0;
++      if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0) {
++        return TRUE;
++      }
++      DWORD pid = 0;
++      GetWindowThreadProcessId(hwnd, &pid);
++      if (pid == ctx->self || is_shell_desktop_window(hwnd)) {
++        return TRUE;
++      }
++      wchar_t title[512];
++      int len = GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
++      if (len <= 0) {
++        return TRUE;
++      }
++      ctx->out.push_back({static_cast<uint64_t>(reinterpret_cast<uintptr_t>(hwnd)), platf::to_utf8(std::wstring_view {title, static_cast<size_t>(len)}), process_name(pid)});
++      return TRUE;
++    }
++
++    bool send_win_d() {
++      INPUT in[4] {};
++      for (auto &i : in) {
++        i.type = INPUT_KEYBOARD;
++      }
++      in[0].ki.wVk = VK_LWIN;
++      in[1].ki.wVk = 'D';
++      in[2].ki.wVk = 'D';
++      in[2].ki.dwFlags = KEYEVENTF_KEYUP;
++      in[3].ki.wVk = VK_LWIN;
++      in[3].ki.dwFlags = KEYEVENTF_KEYUP;
++      return SendInput(4, in, sizeof(INPUT)) == 4;
++    }
++
++    /// Start a command as the logged-in user (Apollo's run_command handles the SYSTEM case) and detach.
++    bool run_as_user(const std::string &cmd) {
++      boost::filesystem::path working_dir;
++      auto env = boost::this_process::environment();
++      std::error_code ec;
++      auto child = platf::run_command(false, false, cmd, working_dir, env, nullptr, ec, nullptr);
++      if (ec) {
++        BOOST_LOG(warning) << "[Orbit] failed to run ["sv << cmd << "]: "sv << ec.message();
++        return false;
++      }
++      child.detach();
++      return true;
++    }
++
++    std::wstring known_folder(REFKNOWNFOLDERID id, HANDLE token) {
++      PWSTR p = nullptr;
++      std::wstring out;
++      if (SUCCEEDED(SHGetKnownFolderPath(id, 0, token, &p)) && p) {
++        out = p;
++      }
++      CoTaskMemFree(p);
++      return out;
++    }
++
++    void collect_links(const std::wstring &root, std::vector<AppEntry> &out) {
++      if (root.empty()) {
++        return;
++      }
++      std::error_code ec;
++      std::filesystem::recursive_directory_iterator it {root, std::filesystem::directory_options::skip_permission_denied, ec};
++      for (; !ec && it != std::filesystem::recursive_directory_iterator {}; it.increment(ec)) {
++        const auto &path = it->path();
++        std::error_code fec;
++        if (!it->is_regular_file(fec)) {
++          continue;
++        }
++        auto ext = path.extension().wstring();
++        if (_wcsicmp(ext.c_str(), L".lnk") != 0) {
++          continue;
++        }
++        auto full = platf::to_utf8(path.wstring());
++        out.push_back({app_id_for_path(full), platf::to_utf8(path.stem().wstring()), full});
++      }
++    }
++
++    /// Default render endpoint volume control (caller holds COM).
++    template<class Fn>
++    bool with_endpoint_volume(Fn fn) {
++      HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++      IMMDeviceEnumerator *enumerator = nullptr;
++      IMMDevice *device = nullptr;
++      IAudioEndpointVolume *endpoint = nullptr;
++      bool ok = false;
++      if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void **>(&enumerator))) &&
++          SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
++          SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&endpoint)))) {
++        ok = SUCCEEDED(fn(endpoint));
++      }
++      if (endpoint) {
++        endpoint->Release();
++      }
++      if (device) {
++        device->Release();
++      }
++      if (enumerator) {
++        enumerator->Release();
++      }
++      if (SUCCEEDED(init)) {
++        CoUninitialize();
++      }
++      return ok;
++    }
++
++    class WinWindowPlatform: public WindowPlatform {
++    public:
++      std::vector<WindowInfo> list() override {
++        return on_input_desktop<std::vector<WindowInfo>>([]() {
++          EnumCtx ctx {{}, GetCurrentProcessId()};
++          EnumWindows(&enum_window, reinterpret_cast<LPARAM>(&ctx));
++          return ctx.out;
++        });
++      }
++
++      ActivateResult activate(uint64_t id) override {
++        return on_input_desktop<ActivateResult>([id]() {
++          HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(id));
++          if (id == 0 || !IsWindow(hwnd)) {
++            return ActivateResult::not_found;
++          }
++          if (higher_integrity(hwnd)) {
++            return ActivateResult::denied;
++          }
++          if (IsIconic(hwnd)) {
++            // Async: a hung target must not block the API thread.
++            ShowWindowAsync(hwnd, SW_RESTORE);
++            for (int i = 0; i < 20 && IsIconic(hwnd); ++i) {
++              std::this_thread::sleep_for(10ms);
++            }
++          }
++          if (SetForegroundWindow(hwnd)) {
++            return ActivateResult::ok;
++          }
++          // Foreground lock: Windows only lets the process that got the last input event switch windows.
++          // An empty (zero-move) mouse input makes us that process; harmless for the current app.
++          INPUT in {};
++          in.type = INPUT_MOUSE;
++          SendInput(1, &in, sizeof(in));
++          if (SetForegroundWindow(hwnd)) {
++            return ActivateResult::ok;
++          }
++          BOOST_LOG(info) << "[Orbit] SetForegroundWindow refused for window "sv << id;
++          return ActivateResult::denied;
++        });
++      }
++
++      bool show_desktop() override {
++        return on_input_desktop<bool>([]() {
++          // Same as Win+D: IShellDispatch4::ToggleDesktop (needs an STA), keyboard fallback.
++          bool ok = false;
++          HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
++          IShellDispatch4 *shell = nullptr;
++          if (SUCCEEDED(CoCreateInstance(kClsidShell, nullptr, CLSCTX_INPROC_SERVER, kIidShellDispatch4, reinterpret_cast<void **>(&shell))) && shell) {
++            ok = SUCCEEDED(shell->ToggleDesktop());
++            shell->Release();
++          }
++          if (SUCCEEDED(init)) {
++            CoUninitialize();
++          }
++          return ok || send_win_d();
++        });
++      }
++
++      std::vector<AppEntry> start_menu() override {
++        std::vector<AppEntry> out;
++        collect_links(known_folder(FOLDERID_CommonPrograms, nullptr), out);
++
++        HANDLE token = nullptr;
++        bool system = platf::is_running_as_system();
++        if (system) {
++          token = platf::retrieve_users_token(false);
++        }
++        // As SYSTEM without a user token, skip the per-user folder rather than listing SYSTEM's own profile.
++        if (!system || token) {
++          collect_links(known_folder(FOLDERID_Programs, token), out);
++        }
++        if (token) {
++          CloseHandle(token);
++        }
++        return out;
++      }
++
++      bool launch(const std::string &id) override {
++        for (auto &a : start_menu()) {
++          if (a.id == id) {
++            BOOST_LOG(info) << "[Orbit] launching Start Menu shortcut ["sv << a.name << ']';
++            return run_as_user("explorer.exe \"" + a.path + "\"");
++          }
++        }
++        return false;
++      }
++
++      bool set_volume(int level) override {
++        float scalar = static_cast<float>(std::clamp(level, 0, 100)) / 100.0f;
++        return with_endpoint_volume([scalar](IAudioEndpointVolume *ep) {
++          return ep->SetMasterVolumeLevelScalar(scalar, nullptr);
++        });
++      }
++
++      bool set_mute(bool mute) override {
++        return with_endpoint_volume([mute](IAudioEndpointVolume *ep) {
++          return ep->SetMute(mute ? TRUE : FALSE, nullptr);
++        });
++      }
++    };
++
++    bool enable_shutdown_privilege() {
++      HANDLE token = nullptr;
++      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
++        return false;
++      }
++      TOKEN_PRIVILEGES tp {};
++      tp.PrivilegeCount = 1;
++      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++      bool ok = LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &tp.Privileges[0].Luid) &&
++                AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
++      CloseHandle(token);
++      return ok;
++    }
++
++    constexpr DWORD kShutdownReason = SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED;
++
++    class WinPowerPlatform: public PowerPlatform {
++    public:
++      bool run(PowerAction action) override {
++        bool ok = false;
++        switch (action) {
++          case PowerAction::shutdown:
++          case PowerAction::restart:
++            // Apps are not forced closed: one with unsaved work can still cancel.
++            ok = enable_shutdown_privilege() &&
++                 InitiateSystemShutdownExW(nullptr, nullptr, 0, FALSE, action == PowerAction::restart, kShutdownReason);
++            break;
++          case PowerAction::sleep:
++            ok = sleep();
++            break;
++          case PowerAction::logoff:
++            ok = platf::is_running_as_system() ? WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, WTSGetActiveConsoleSessionId(), FALSE) : ExitWindowsEx(EWX_LOGOFF, kShutdownReason);
++            break;
++          case PowerAction::lock:
++            ok = platf::is_running_as_system() ? run_as_user("rundll32.exe user32.dll,LockWorkStation") : LockWorkStation();
++            break;
++        }
++        if (!ok) {
++          BOOST_LOG(warning) << "[Orbit] power "sv << power_action_name(action) << " failed: "sv << GetLastError();
++        }
++        return ok;
++      }
++
++    private:
++      using set_suspend_state_fn = BOOLEAN(WINAPI *)(BOOLEAN, BOOLEAN, BOOLEAN);
++
++      static bool sleep() {
++        // powrprof is loaded on demand (not in the link line). SetSuspendState blocks until resume, so it runs
++        // shortly after on a detached thread and the HTTP reply goes out first.
++        HMODULE lib = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        if (!lib) {
++          return false;
++        }
++        auto fn = reinterpret_cast<set_suspend_state_fn>(reinterpret_cast<void *>(GetProcAddress(lib, "SetSuspendState")));
++        if (!fn || !enable_shutdown_privilege()) {
++          FreeLibrary(lib);
++          return false;
++        }
++        std::thread([lib, fn]() {
++          std::this_thread::sleep_for(500ms);
++          if (!fn(FALSE, FALSE, FALSE)) {
++            BOOST_LOG(warning) << "[Orbit] SetSuspendState failed: "sv << GetLastError();
++          }
++          FreeLibrary(lib);
++        }).detach();
++        return true;
++      }
++    };
++  }  // namespace
++
++  std::shared_ptr<WindowPlatform> make_platform_windows() {
++    return std::make_shared<WinWindowPlatform>();
++  }
++
++  std::shared_ptr<PowerPlatform> make_platform_power() {
++    return std::make_shared<WinPowerPlatform>();
++  }
++}  // namespace orbit
+diff --git a/src/orbit/power_api.cpp b/src/orbit/power_api.cpp
+new file mode 100644
+index 00000000..b5cdeec3
+--- /dev/null
++++ b/src/orbit/power_api.cpp
+@@ -0,0 +1,85 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/power_api.cpp
++ * @brief Power actions endpoint (platform independent part).
++ */
++#include "power_api.h"
++
++#include "src/logging.h"
++
++namespace orbit {
++  std::optional<PowerAction> parse_power_action(std::string_view s) {
++    if (s == "shutdown") {
++      return PowerAction::shutdown;
++    }
++    if (s == "restart") {
++      return PowerAction::restart;
++    }
++    if (s == "sleep") {
++      return PowerAction::sleep;
++    }
++    if (s == "logoff") {
++      return PowerAction::logoff;
++    }
++    if (s == "lock") {
++      return PowerAction::lock;
++    }
++    return std::nullopt;
++  }
++
++  const char *power_action_name(PowerAction a) {
++    switch (a) {
++      case PowerAction::shutdown:
++        return "shutdown";
++      case PowerAction::restart:
++        return "restart";
++      case PowerAction::sleep:
++        return "sleep";
++      case PowerAction::logoff:
++        return "logoff";
++      case PowerAction::lock:
++        return "lock";
++    }
++    return "?";
++  }
++
++  ApiReply power_reply(const crypto::named_cert_t *cert, PowerPlatform &p, const Query &query, const log_fn &log) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_power)) {
++      return {err, {}};
++    }
++    auto it = query.find("action");
++    auto action = it == query.end() ? std::nullopt : parse_power_action(it->second);
++    if (!action) {
++      return error_reply(400, "bad_action");
++    }
++
++    // Spec §10.5: the app confirms; the host logs who asked.
++    std::string line = std::string {"[Orbit] power "} + power_action_name(*action) + " pedido por " + cert->name;
++    if (log) {
++      log(line);
++    } else {
++      BOOST_LOG(info) << line;
++    }
++
++    if (!p.run(*action)) {
++      return error_reply(500, "failed");
++    }
++    return {200, R"({"ok":true})"};
++  }
++}  // namespace orbit
+diff --git a/src/orbit/power_api.h b/src/orbit/power_api.h
+new file mode 100644
+index 00000000..dde9ab24
+--- /dev/null
++++ b/src/orbit/power_api.h
+@@ -0,0 +1,62 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/power_api.h
++ * @brief Power actions (/orbit/power?action=shutdown|restart|sleep|logoff|lock).
++ */
++#pragma once
++
++#include "api_reply.h"
++
++#include <functional>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace orbit {
++  enum class PowerAction {
++    shutdown,
++    restart,
++    sleep,
++    logoff,
++    lock
++  };
++
++  /// System side of /orbit/power. Implementations must not throw.
++  class PowerPlatform {
++  public:
++    virtual ~PowerPlatform() = default;
++    virtual bool run(PowerAction action) = 0;
++  };
++
++  /// Windows implementation (platform_windows_win.cpp). Never null.
++  std::shared_ptr<PowerPlatform> make_platform_power();
++
++  std::optional<PowerAction> parse_power_action(std::string_view s);
++  const char *power_action_name(PowerAction a);
++
++  using log_fn = std::function<void(const std::string &)>;
++
++  /**
++   * @brief POST /orbit/power?action=. Needs orbit_power; unknown/missing action -> 400.
++   * Logs "[Orbit] power <action> pedido por <device name>" (to `log`, or the host log at info when empty)
++   * before running the action; 500 when the action fails.
++   */
++  ApiReply power_reply(const crypto::named_cert_t *cert, PowerPlatform &p, const Query &query, const log_fn &log = {});
++}  // namespace orbit
+diff --git a/src/orbit/windows_api.cpp b/src/orbit/windows_api.cpp
+new file mode 100644
+index 00000000..e2d5e9d2
+--- /dev/null
++++ b/src/orbit/windows_api.cpp
+@@ -0,0 +1,172 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/windows_api.cpp
++ * @brief Window switching, Start Menu apps, show desktop and volume endpoints (platform independent part).
++ */
++#include "windows_api.h"
++
++#include <algorithm>
++#include <cctype>
++#include <charconv>
++#include <cstdio>
++#include <nlohmann/json.hpp>
++
++namespace orbit {
++  namespace {
++    std::string dump(const nlohmann::json &j) {
++      // Titles and names come from other programs and may hold invalid UTF-8: replace instead of throwing.
++      return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
++    }
++
++    const ApiReply kOk {200, R"({"ok":true})"};
++
++    bool parse_int(const std::string &s, long long &out) {
++      if (s.empty()) {
++        return false;
++      }
++      auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
++      return ec == std::errc {} && p == s.data() + s.size();
++    }
++
++    bool parse_u64(const std::string &s, uint64_t &out) {
++      if (s.empty()) {
++        return false;
++      }
++      auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
++      return ec == std::errc {} && p == s.data() + s.size();
++    }
++
++    std::string lower(std::string s) {
++      std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++      });
++      return s;
++    }
++  }  // namespace
++
++  std::string app_id_for_path(const std::string &path) {
++    uint64_t h = 1469598103934665603ULL;  // FNV-1a 64
++    for (unsigned char c : lower(path)) {
++      h ^= c;
++      h *= 1099511628211ULL;
++    }
++    char buf[17];
++    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
++    return buf;
++  }
++
++  ApiReply windows_list_reply(const crypto::named_cert_t *cert, WindowPlatform &p) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_windows)) {
++      return {err, {}};
++    }
++    auto arr = nlohmann::json::array();
++    for (auto &w : p.list()) {
++      arr.push_back({{"id", w.id}, {"title", w.title}, {"process", w.process}});
++    }
++    return {200, dump({{"windows", arr}})};
++  }
++
++  ApiReply window_activate_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_windows)) {
++      return {err, {}};
++    }
++    uint64_t id = 0;
++    auto it = query.find("id");
++    if (it == query.end() || !parse_u64(it->second, id)) {
++      return error_reply(400, "bad_request");
++    }
++    switch (p.activate(id)) {
++      case ActivateResult::ok:
++        return kOk;
++      case ActivateResult::not_found:
++        return error_reply(404, "not_found");
++      case ActivateResult::denied:
++      default:
++        return error_reply(409, "denied");
++    }
++  }
++
++  ApiReply desktop_reply(const crypto::named_cert_t *cert, WindowPlatform &p) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_windows)) {
++      return {err, {}};
++    }
++    return p.show_desktop() ? kOk : error_reply(500, "failed");
++  }
++
++  ApiReply apps_list_reply(const crypto::named_cert_t *cert, WindowPlatform &p) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_windows)) {
++      return {err, {}};
++    }
++    auto apps = p.start_menu();
++    std::stable_sort(apps.begin(), apps.end(), [](const AppEntry &a, const AppEntry &b) {
++      return lower(a.name) < lower(b.name);
++    });
++    auto arr = nlohmann::json::array();
++    for (auto &a : apps) {
++      arr.push_back({{"id", a.id}, {"name", a.name}});
++    }
++    return {200, dump({{"apps", arr}})};
++  }
++
++  ApiReply app_launch_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query) {
++    if (int err = perm_error(cert, crypto::PERM::orbit_windows)) {
++      return {err, {}};
++    }
++    auto it = query.find("id");
++    if (it == query.end() || it->second.empty()) {
++      return error_reply(400, "bad_request");
++    }
++    auto apps = p.start_menu();
++    bool known = std::any_of(apps.begin(), apps.end(), [&](const AppEntry &a) {
++      return a.id == it->second;
++    });
++    if (!known) {
++      return error_reply(404, "not_found");
++    }
++    return p.launch(it->second) ? kOk : error_reply(500, "failed");
++  }
++
++  ApiReply volume_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query) {
++    if (int err = perm_error(cert, crypto::PERM::input_kbd)) {
++      return {err, {}};
++    }
++    auto level_it = query.find("level");
++    auto mute_it = query.find("mute");
++    if (level_it == query.end() && mute_it == query.end()) {
++      return error_reply(400, "bad_request");
++    }
++
++    long long level = 0;
++    if (level_it != query.end() && !parse_int(level_it->second, level)) {
++      return error_reply(400, "bad_request");
++    }
++    if (mute_it != query.end() && mute_it->second != "0" && mute_it->second != "1") {
++      return error_reply(400, "bad_request");
++    }
++
++    bool ok = true;
++    if (level_it != query.end()) {
++      ok = p.set_volume(static_cast<int>(std::clamp<long long>(level, 0, 100))) && ok;
++    }
++    if (mute_it != query.end()) {
++      ok = p.set_mute(mute_it->second == "1") && ok;
++    }
++    return ok ? kOk : error_reply(500, "failed");
++  }
++}  // namespace orbit
+diff --git a/src/orbit/windows_api.h b/src/orbit/windows_api.h
+new file mode 100644
+index 00000000..cb5391e5
+--- /dev/null
++++ b/src/orbit/windows_api.h
+@@ -0,0 +1,90 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/windows_api.h
++ * @brief Window switching, Start Menu apps, show desktop and volume (/orbit/windows, /orbit/apps, /orbit/desktop, /orbit/volume).
++ */
++#pragma once
++
++#include "api_reply.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace orbit {
++  /// A visible top-level window. `id` is the HWND value.
++  struct WindowInfo {
++    uint64_t id;
++    std::string title;
++    std::string process;  ///< image name, e.g. "notepad.exe"
++  };
++
++  /// A Start Menu shortcut. `id` is a stable hash of `path`; `name` is the file stem.
++  struct AppEntry {
++    std::string id;
++    std::string name;
++    std::string path;  ///< full .lnk path (UTF-8); never sent to clients
++  };
++
++  enum class ActivateResult {
++    ok,
++    not_found,  ///< no such window
++    denied  ///< elevated/higher integrity target or Windows refused the switch
++  };
++
++  /// System side of the window/app/volume endpoints. Implementations must not throw.
++  class WindowPlatform {
++  public:
++    virtual ~WindowPlatform() = default;
++    virtual std::vector<WindowInfo> list() = 0;
++    virtual ActivateResult activate(uint64_t id) = 0;
++    virtual bool show_desktop() = 0;
++    virtual std::vector<AppEntry> start_menu() = 0;
++    /// Launch the Start Menu entry with this id as the logged-in user.
++    virtual bool launch(const std::string &id) = 0;
++    /// Master volume 0..100.
++    virtual bool set_volume(int level) = 0;
++    virtual bool set_mute(bool mute) = 0;
++  };
++
++  /// Windows implementation (platform_windows_win.cpp). Never null.
++  std::shared_ptr<WindowPlatform> make_platform_windows();
++
++  /// Stable id for a shortcut path (FNV-1a 64 of the lower-cased path, 16 hex digits).
++  std::string app_id_for_path(const std::string &path);
++
++  /// GET /orbit/windows -> {"windows":[{id,title,process}]}. Needs orbit_windows.
++  ApiReply windows_list_reply(const crypto::named_cert_t *cert, WindowPlatform &p);
++
++  /// POST /orbit/windows/activate?id= -> 200, 400 bad id, 404 not_found, 409 denied. Needs orbit_windows.
++  ApiReply window_activate_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query);
++
++  /// POST /orbit/desktop. Needs orbit_windows.
++  ApiReply desktop_reply(const crypto::named_cert_t *cert, WindowPlatform &p);
++
++  /// GET /orbit/apps -> {"apps":[{id,name}]} sorted by name. Needs orbit_windows.
++  ApiReply apps_list_reply(const crypto::named_cert_t *cert, WindowPlatform &p);
++
++  /// POST /orbit/apps/launch?id= -> 200, 400 missing id, 404 not_found, 500 launch failed. Needs orbit_windows.
++  ApiReply app_launch_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query);
++
++  /// POST /orbit/volume?level=0..100 (clamped) and/or mute=0|1. Needs input_kbd.
++  ApiReply volume_reply(const crypto::named_cert_t *cert, WindowPlatform &p, const Query &query);
++}  // namespace orbit
+diff --git a/tests/unit/test_power_api.cpp b/tests/unit/test_power_api.cpp
+new file mode 100644
+index 00000000..77ab8c5d
+--- /dev/null
++++ b/tests/unit/test_power_api.cpp
+@@ -0,0 +1,97 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_power_api.cpp
++ * @brief Test src/orbit/power_api.* with a fake platform (never touches the real PC power state).
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/power_api.h>
++#include <utility>
++#include <vector>
++
++namespace {
++  struct FakePower: orbit::PowerPlatform {
++    std::vector<orbit::PowerAction> ran;
++    bool result = true;
++
++    bool run(orbit::PowerAction a) override {
++      ran.push_back(a);
++      return result;
++    }
++  };
++
++  crypto::named_cert_t cert_with(crypto::PERM perm, const std::string &name = "Poco F5") {
++    crypto::named_cert_t c {};
++    c.name = name;
++    c.perm = perm;
++    return c;
++  }
++
++  orbit::log_fn sink(std::vector<std::string> &lines) {
++    return [&lines](const std::string &l) {
++      lines.push_back(l);
++    };
++  }
++}  // namespace
++
++TEST(PowerApi, InvalidActionIs400) {
++  FakePower p;
++  std::vector<std::string> log;
++  auto c = cert_with(crypto::PERM::orbit_power);
++  EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "explode"}}, sink(log)).status, 400);
++  EXPECT_EQ(orbit::power_reply(&c, p, {}, sink(log)).status, 400);
++  EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "Shutdown"}}, sink(log)).status, 400);
++  EXPECT_TRUE(p.ran.empty());
++
++  const std::vector<std::pair<std::string, orbit::PowerAction>> all {
++    {"shutdown", orbit::PowerAction::shutdown},
++    {"restart", orbit::PowerAction::restart},
++    {"sleep", orbit::PowerAction::sleep},
++    {"logoff", orbit::PowerAction::logoff},
++    {"lock", orbit::PowerAction::lock},
++  };
++  for (const auto &[name, action] : all) {
++    p.ran.clear();
++    EXPECT_EQ(orbit::power_reply(&c, p, {{"action", name}}, sink(log)).status, 200) << name;
++    ASSERT_EQ(p.ran.size(), 1u);
++    EXPECT_EQ(p.ran[0], action);
++  }
++
++  p.result = false;
++  EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "lock"}}, sink(log)).status, 500);
++}
++
++TEST(PowerApi, RequiresOrbitPowerPerm) {
++  FakePower p;
++  std::vector<std::string> log;
++  auto c = cert_with(static_cast<crypto::PERM>(static_cast<uint32_t>(crypto::PERM::_all) & ~static_cast<uint32_t>(crypto::PERM::orbit_power)));
++  EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "shutdown"}}, sink(log)).status, 403);
++  EXPECT_EQ(orbit::power_reply(nullptr, p, {{"action", "shutdown"}}, sink(log)).status, 401);
++  EXPECT_TRUE(p.ran.empty());
++  EXPECT_TRUE(log.empty());
++}
++
++TEST(PowerApi, LogsDeviceName) {
++  FakePower p;
++  std::vector<std::string> log;
++  auto c = cert_with(crypto::PERM::orbit_power, "TL10 da sala");
++  EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "sleep"}}, sink(log)).status, 200);
++  ASSERT_EQ(log.size(), 1u);
++  EXPECT_EQ(log[0], "[Orbit] power sleep pedido por TL10 da sala");
++}
+diff --git a/tests/unit/test_windows_api.cpp b/tests/unit/test_windows_api.cpp
+new file mode 100644
+index 00000000..79a6390a
+--- /dev/null
++++ b/tests/unit/test_windows_api.cpp
+@@ -0,0 +1,207 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_windows_api.cpp
++ * @brief Test src/orbit/windows_api.* (window, app, desktop and volume endpoints) with a fake platform.
++ */
++#include "../tests_common.h"
++
++#include <nlohmann/json.hpp>
++#include <src/orbit/windows_api.h>
++
++namespace {
++  struct FakeWindows: orbit::WindowPlatform {
++    std::vector<orbit::WindowInfo> windows {{0x1234, "Doc - Notepad", "notepad.exe"}, {0x5678, "Admin console", "cmd.exe"}};
++    std::vector<orbit::AppEntry> apps {{"b2", "Zeta", "C:\\z.lnk"}, {"a1", "alpha", "C:\\a.lnk"}};
++    uint64_t elevated_id = 0x5678;
++    int calls = 0;
++    uint64_t activated = 0;
++    std::string launched;
++    int volume = -1;
++    int mute = -1;  // -1 = not called
++
++    std::vector<orbit::WindowInfo> list() override {
++      ++calls;
++      return windows;
++    }
++
++    orbit::ActivateResult activate(uint64_t id) override {
++      ++calls;
++      if (id == elevated_id) {
++        return orbit::ActivateResult::denied;
++      }
++      for (auto &w : windows) {
++        if (w.id == id) {
++          activated = id;
++          return orbit::ActivateResult::ok;
++        }
++      }
++      return orbit::ActivateResult::not_found;
++    }
++
++    bool show_desktop() override {
++      ++calls;
++      return true;
++    }
++
++    std::vector<orbit::AppEntry> start_menu() override {
++      ++calls;
++      return apps;
++    }
++
++    bool launch(const std::string &id) override {
++      ++calls;
++      launched = id;
++      return true;
++    }
++
++    bool set_volume(int level) override {
++      ++calls;
++      volume = level;
++      return true;
++    }
++
++    bool set_mute(bool m) override {
++      ++calls;
++      mute = m ? 1 : 0;
++      return true;
++    }
++  };
++
++  crypto::named_cert_t cert_with(crypto::PERM perm) {
++    crypto::named_cert_t c {};
++    c.name = "Poco";
++    c.perm = perm;
++    return c;
++  }
++
++  crypto::PERM all_but(crypto::PERM bit) {
++    return static_cast<crypto::PERM>(static_cast<uint32_t>(crypto::PERM::_all) & ~static_cast<uint32_t>(bit));
++  }
++
++  const auto kWindowsPerm = crypto::PERM::orbit_windows;
++}  // namespace
++
++TEST(WindowsApi, ListsWindowsAsJson) {
++  FakeWindows p;
++  auto c = cert_with(kWindowsPerm);
++  auto r = orbit::windows_list_reply(&c, p);
++  ASSERT_EQ(r.status, 200);
++  auto j = nlohmann::json::parse(r.body);
++  ASSERT_EQ(j["windows"].size(), 2u);
++  EXPECT_EQ(j["windows"][0]["id"].get<uint64_t>(), 0x1234u);
++  EXPECT_EQ(j["windows"][0]["title"], "Doc - Notepad");
++  EXPECT_EQ(j["windows"][0]["process"], "notepad.exe");
++}
++
++TEST(WindowsApi, ActivateMissingIs404) {
++  FakeWindows p;
++  auto c = cert_with(kWindowsPerm);
++  auto r = orbit::window_activate_reply(&c, p, {{"id", "999"}});
++  EXPECT_EQ(r.status, 404);
++  EXPECT_EQ(nlohmann::json::parse(r.body)["error"], "not_found");
++
++  EXPECT_EQ(orbit::window_activate_reply(&c, p, {{"id", std::to_string(0x1234)}}).status, 200);
++  EXPECT_EQ(p.activated, 0x1234u);
++
++  EXPECT_EQ(orbit::window_activate_reply(&c, p, {}).status, 400);
++  EXPECT_EQ(orbit::window_activate_reply(&c, p, {{"id", "x1"}}).status, 400);
++}
++
++TEST(WindowsApi, ActivateElevatedIs409) {
++  FakeWindows p;
++  auto c = cert_with(kWindowsPerm);
++  auto r = orbit::window_activate_reply(&c, p, {{"id", std::to_string(0x5678)}});
++  EXPECT_EQ(r.status, 409);
++  EXPECT_EQ(nlohmann::json::parse(r.body)["error"], "denied");
++}
++
++TEST(WindowsApi, RequiresOrbitWindowsPerm) {
++  FakeWindows p;
++  auto c = cert_with(all_but(kWindowsPerm));
++  EXPECT_EQ(orbit::windows_list_reply(&c, p).status, 403);
++  EXPECT_EQ(orbit::window_activate_reply(&c, p, {{"id", "4660"}}).status, 403);
++  EXPECT_EQ(orbit::desktop_reply(&c, p).status, 403);
++  EXPECT_EQ(orbit::apps_list_reply(&c, p).status, 403);
++  EXPECT_EQ(orbit::app_launch_reply(&c, p, {{"id", "a1"}}).status, 403);
++  EXPECT_EQ(p.calls, 0);
++
++  EXPECT_EQ(orbit::windows_list_reply(nullptr, p).status, 401);
++  EXPECT_EQ(orbit::desktop_reply(nullptr, p).status, 401);
++  EXPECT_EQ(p.calls, 0);
++
++  auto ok = cert_with(kWindowsPerm);
++  EXPECT_EQ(orbit::desktop_reply(&ok, p).status, 200);
++}
++
++TEST(WindowsApi, AppsSortedByNameAndLaunchById) {
++  FakeWindows p;
++  auto c = cert_with(kWindowsPerm);
++  auto r = orbit::apps_list_reply(&c, p);
++  ASSERT_EQ(r.status, 200);
++  auto j = nlohmann::json::parse(r.body);
++  ASSERT_EQ(j["apps"].size(), 2u);
++  EXPECT_EQ(j["apps"][0]["name"], "alpha");
++  EXPECT_EQ(j["apps"][0]["id"], "a1");
++  EXPECT_FALSE(j["apps"][0].contains("path"));
++  EXPECT_EQ(j["apps"][1]["name"], "Zeta");
++
++  EXPECT_EQ(orbit::app_launch_reply(&c, p, {{"id", "b2"}}).status, 200);
++  EXPECT_EQ(p.launched, "b2");
++  EXPECT_EQ(orbit::app_launch_reply(&c, p, {{"id", "nope"}}).status, 404);
++  EXPECT_EQ(orbit::app_launch_reply(&c, p, {}).status, 400);
++}
++
++TEST(WindowsApi, AppIdIsStableAndCaseInsensitive) {
++  auto a = orbit::app_id_for_path("C:\\ProgramData\\Start Menu\\Programs\\Calc.lnk");
++  EXPECT_EQ(a, orbit::app_id_for_path("c:\\programdata\\start menu\\programs\\calc.lnk"));
++  EXPECT_NE(a, orbit::app_id_for_path("C:\\ProgramData\\Start Menu\\Programs\\Other.lnk"));
++  EXPECT_EQ(a.size(), 16u);
++}
++
++TEST(VolumeApi, ClampsLevel) {
++  FakeWindows p;
++  auto c = cert_with(crypto::PERM::input_kbd);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"level", "150"}}).status, 200);
++  EXPECT_EQ(p.volume, 100);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"level", "-5"}}).status, 200);
++  EXPECT_EQ(p.volume, 0);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"level", "42"}}).status, 200);
++  EXPECT_EQ(p.volume, 42);
++  EXPECT_EQ(p.mute, -1);
++}
++
++TEST(VolumeApi, MuteAndValidation) {
++  FakeWindows p;
++  auto c = cert_with(crypto::PERM::input_kbd);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"mute", "1"}}).status, 200);
++  EXPECT_EQ(p.mute, 1);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"mute", "0"}}).status, 200);
++  EXPECT_EQ(p.mute, 0);
++  EXPECT_EQ(p.volume, -1);
++
++  EXPECT_EQ(orbit::volume_reply(&c, p, {}).status, 400);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"mute", "2"}}).status, 400);
++  EXPECT_EQ(orbit::volume_reply(&c, p, {{"level", "loud"}}).status, 400);
++
++  auto no_kbd = cert_with(all_but(crypto::PERM::input_kbd));
++  int before = p.calls;
++  EXPECT_EQ(orbit::volume_reply(&no_kbd, p, {{"level", "10"}}).status, 403);
++  EXPECT_EQ(orbit::volume_reply(nullptr, p, {{"level", "10"}}).status, 401);
++  EXPECT_EQ(p.calls, before);
++}
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="pt-BR" data-estado="preto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duvo - Flash de latência</title>
+<!--
+Duvo - Flash de latência (ferramenta de medição)
+Copyright (C) 2026 Contribuidores do Projeto Duvo
+
+Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo
+sob os termos da GNU General Public License versão 3, conforme publicada
+pela Free Software Foundation.
+
+Este programa é distribuído na esperança de que seja útil, mas SEM
+QUALQUER GARANTIA; sem mesmo a garantia implícita de COMERCIALIZAÇÃO ou
+ADEQUAÇÃO A UMA FINALIDADE ESPECÍFICA. Veja a GNU General Public License
+para mais detalhes: <https://www.gnu.org/licenses/>.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+    font-family: system-ui, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  html {
+    background: #000;
+  }
+  html[data-estado="branco"] {
+    background: #fff;
+  }
+  body {
+    position: fixed;
+    inset: 0;
+    background: inherit;
+  }
+  #contador {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    margin: 0;
+    text-align: center;
+    font-family: "Consolas", "Courier New", monospace;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    font-size: min(22vw, 34vh);
+    line-height: 1;
+    color: #fff;
+    white-space: nowrap;
+  }
+  html[data-estado="branco"] #contador {
+    color: #000;
+  }
+  #dica {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: 16px;
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.4;
+    color: #808080;
+    text-align: center;
+  }
+  #dica[hidden] {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<p id="contador" aria-live="off">0.0 ms</p>
+<p id="dica">Mantenha qualquer tecla ou botão do mouse pressionado para a tela ficar branca. Solte para voltar ao preto. Este texto some na primeira entrada.</p>
+<script>
+(function () {
+  'use strict';
+
+  var root = document.documentElement;
+  var contador = document.getElementById('contador');
+  var dica = document.getElementById('dica');
+
+  // Entradas atualmente pressionadas. Usar um conjunto evita que a
+  // repetição automática do teclado (keydown repetido) cause piscadas.
+  var pressionados = new Set();
+
+  function atualizar() {
+    root.dataset.estado = pressionados.size > 0 ? 'branco' : 'preto';
+  }
+
+  function esconderDica() {
+    if (dica && !dica.hidden) {
+      dica.hidden = true;
+    }
+  }
+
+  function pressionar(id) {
+    pressionados.add(id);
+    esconderDica();
+    atualizar();
+  }
+
+  function soltar(id) {
+    pressionados.delete(id);
+    atualizar();
+  }
+
+  function zerar() {
+    pressionados.clear();
+    atualizar();
+  }
+
+  window.addEventListener('keydown', function (e) {
+    if (e.repeat) {
+      return;
+    }
+    pressionar('tecla:' + (e.code || e.key));
+  });
+
+  window.addEventListener('keyup', function (e) {
+    soltar('tecla:' + (e.code || e.key));
+  });
+
+  window.addEventListener('pointerdown', function (e) {
+    pressionar('ponteiro:' + e.pointerId + ':' + e.button);
+  });
+
+  window.addEventListener('pointerup', function (e) {
+    soltar('ponteiro:' + e.pointerId + ':' + e.button);
+  });
+
+  window.addEventListener('pointercancel', zerar);
+  window.addEventListener('blur', zerar);
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      zerar();
+    }
+  });
+
+  // Evita o menu de contexto do botão direito, que poderia engolir o soltar.
+  window.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+  });
+
+  // Contador de milissegundos desde o carregamento da página, atualizado a
+  // cada quadro para que um vídeo em câmera lenta possa ser lido quadro a quadro.
+  var ultimoTexto = '';
+
+  function quadro() {
+    var texto = performance.now().toFixed(1) + ' ms';
+    if (texto !== ultimoTexto) {
+      contador.textContent = texto;
+      ultimoTexto = texto;
+    }
+    requestAnimationFrame(quadro);
+  }
+
+  requestAnimationFrame(quadro);
+})();
+</script>
+</body>
+</html>

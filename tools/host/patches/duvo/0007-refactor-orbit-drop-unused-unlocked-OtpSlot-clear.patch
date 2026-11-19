@@ -1,0 +1,40 @@
+From ec5a7996e87743ba94a7e1e8ebe1da6535c5328d Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:14:59 -0300
+Subject: [PATCH 07/28] refactor(orbit): drop unused, unlocked OtpSlot::clear()
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/orbit/otp_slot.cpp | 4 ----
+ src/orbit/otp_slot.h   | 2 --
+ 2 files changed, 6 deletions(-)
+
+diff --git a/src/orbit/otp_slot.cpp b/src/orbit/otp_slot.cpp
+index eb07aeaa..deca28d2 100644
+--- a/src/orbit/otp_slot.cpp
++++ b/src/orbit/otp_slot.cpp
+@@ -46,8 +46,4 @@ namespace orbit {
+       return true;
+     }).otp;
+   }
+-
+-  void OtpSlot::clear() {
+-    otp_.reset();
+-  }
+ }  // namespace orbit
+diff --git a/src/orbit/otp_slot.h b/src/orbit/otp_slot.h
+index 6c47f4b2..53445f68 100644
+--- a/src/orbit/otp_slot.h
++++ b/src/orbit/otp_slot.h
+@@ -65,8 +65,6 @@ namespace orbit {
+     /// Return the pending OTP if valid and clear it (single use).
+     std::optional<Otp> take(clock::time_point now);
+ 
+-    void clear();
+-
+   private:
+     std::mutex m_;
+     std::chrono::seconds ttl_;
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,537 @@
+From 9e37654806367929308838d100cd6145fd983f83 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:38:01 -0300
+Subject: [PATCH 23/28] feat(web): Devices page as the home (QR on open),
+ sidebar navigation, pt-BR default, index redirect
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/config.cpp                                |   2 +-
+ src_assets/common/assets/web/Navbar.vue       |  15 +-
+ src_assets/common/assets/web/index.html       | 159 +----------------
+ src_assets/common/assets/web/pin.html         | 166 ++++++++++--------
+ .../assets/web/public/assets/css/duvo.css     |  22 +++
+ .../assets/web/public/assets/locale/en.json   |  11 +-
+ .../web/public/assets/locale/pt_BR.json       |  11 +-
+ 7 files changed, 137 insertions(+), 249 deletions(-)
+
+diff --git a/src/config.cpp b/src/config.cpp
+index a7627b06..321bff11 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -584,7 +584,7 @@ namespace config {
+     true, // enable_pairing
+     true, // enable_discovery
+     false, // envvar_compatibility_mode
+-    "en",  // locale
++    "pt_BR",  // locale (ORBIT: Duvo defaults to Brazilian Portuguese)
+     2,  // min_log_level
+     0,  // flags
+     {},  // User file
+diff --git a/src_assets/common/assets/web/Navbar.vue b/src_assets/common/assets/web/Navbar.vue
+index 1acd4ef1..c1ae409b 100644
+--- a/src_assets/common/assets/web/Navbar.vue
++++ b/src_assets/common/assets/web/Navbar.vue
+@@ -12,27 +12,24 @@
+       <div class="collapse navbar-collapse" id="navbarSupportedContent">
+         <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+           <li class="nav-item">
+-            <a class="nav-link" href="./"><i class="fas fa-fw fa-home"></i> {{ $t('navbar.home') }}</a>
+-          </li>
+-          <li class="nav-item">
+-            <a class="nav-link" href="./pin"><i class="fas fa-fw fa-unlock"></i> {{ $t('navbar.pin') }}</a>
++            <a class="nav-link" href="./pin"><i class="fas fa-fw fa-mobile-screen"></i> {{ $t('navbar.home') }}</a>
+           </li>
+           <li class="nav-item">
+             <a class="nav-link" href="./apps"><i class="fas fa-fw fa-stream"></i> {{ $t('navbar.applications') }}</a>
+           </li>
+           <li class="nav-item">
+-            <a class="nav-link" href="./config"><i class="fas fa-fw fa-cog"></i> {{ $t('navbar.configuration') }}</a>
++            <a class="nav-link" href="./config"><i class="fas fa-fw fa-sliders"></i> {{ $t('navbar.configuration') }}</a>
+           </li>
+           <li class="nav-item">
+             <a class="nav-link" href="./password"><i class="fas fa-fw fa-user-shield"></i> {{ $t('navbar.password') }}</a>
+           </li>
+           <li class="nav-item">
+-            <a class="nav-link" href="./troubleshooting"><i class="fas fa-fw fa-info"></i> {{ $t('navbar.troubleshoot') }}</a>
+-          </li>
+-          <li class="nav-item">
+-            <ThemeToggle/>
++            <a class="nav-link" href="./troubleshooting"><i class="fas fa-fw fa-circle-info"></i> {{ $t('navbar.troubleshoot') }}</a>
+           </li>
+         </ul>
++        <div class="duvo-sidebar-foot">
++          <ThemeToggle/>
++        </div>
+       </div>
+     </div>
+   </nav>
+diff --git a/src_assets/common/assets/web/index.html b/src_assets/common/assets/web/index.html
+index 1dc94d60..7ed3617f 100644
+--- a/src_assets/common/assets/web/index.html
++++ b/src_assets/common/assets/web/index.html
+@@ -1,162 +1,13 @@
+ <!DOCTYPE html>
+-<html lang="en" data-bs-theme="auto">
++<html lang="pt-BR" data-bs-theme="dark">
+ 
+ <head>
+   <%- header %>
++  <meta http-equiv="refresh" content="0;url=./pin">
+ </head>
+ 
+-<body id="app" v-cloak>
+-  <Navbar></Navbar>
+-  <div id="content" class="container">
+-    <h1 class="my-4">{{ $t('index.welcome') }}</h1>
+-    <p>{{ $t('index.description') }}</p>
+-    <div class="alert alert-danger" v-if="fancyLogs.find(x => x.level === 'Fatal')">
+-      <div style="line-height: 32px;">
+-        <i class="fas fa-circle-exclamation" style="font-size: 32px;margin-right: 0.25em;"></i>
+-        <p v-html="$t('index.startup_errors')"></p>
+-        <br>
+-      </div>
+-      <ul>
+-        <li v-for="v in fancyLogs.filter(x => x.level === 'Fatal')">{{v.value}}</li>
+-      </ul>
+-      <a class="btn btn-danger" href="./troubleshooting#logs">View Logs</a>
+-    </div>
+-    <!-- Version -->
+-    <div class="card p-2 my-4">
+-      <div class="card-body" v-if="version">
+-        <h2>Version {{version.version}}</h2>
+-        <br>
+-        <div v-if="loading">
+-          {{ $t('index.loading_latest') }}
+-        </div>
+-        <div class="alert alert-success" v-if="buildVersionIsDirty">
+-          {{ $t('index.version_dirty') }} 🌇
+-        </div>
+-        <div class="alert alert-info" v-if="installedVersionNotStable">
+-          {{ $t('index.installed_version_not_stable') }}
+-        </div>
+-        <div v-else-if="(!preReleaseBuildAvailable || !notifyPreReleases) && !stableBuildAvailable && !buildVersionIsDirty">
+-          <div class="alert alert-success">
+-            {{ $t('index.version_latest') }}
+-          </div>
+-        </div>
+-        <div v-if="notifyPreReleases && preReleaseBuildAvailable">
+-          <div class="alert alert-warning">
+-            <div class="d-flex justify-content-between">
+-              <div class="my-2">
+-                <p>{{ $t('index.new_pre_release') }}</p>
+-              </div>
+-              <a class="btn btn-success m-1" :href="preReleaseVersion.release.html_url" target="_blank">{{ $t('index.download') }}</a>
+-            </div>
+-            <pre><b>{{preReleaseVersion.release.name}}</b></pre>
+-            <pre>{{preReleaseVersion.release.body}}</pre>
+-          </div>
+-        </div>
+-        <div v-if="stableBuildAvailable">
+-          <div class="alert alert-warning">
+-            <div class="d-flex justify-content-between">
+-              <div class="my-2">
+-                <p>{{ $t('index.new_stable') }}</p>
+-              </div>
+-              <a class="btn btn-success m-1" :href="githubVersion.release.html_url" target="_blank">{{ $t('index.download') }}</a>
+-            </div>
+-            <h3>{{githubVersion.release.name}}</h3>
+-            <pre>{{githubVersion.release.body}}</pre>
+-          </div>
+-        </div>
+-      </div>
+-    </div>
+-    <!-- Resources -->
+-    <div class="my-4">
+-      <Client-Card></Client-Card>
+-      <Resource-Card></Resource-Card>
+-    </div>
+-  </div>
++<body>
++  <p style="padding: 2rem"><a href="./pin">Abrir o Duvo</a></p>
+ </body>
+ 
+-<script type="module">
+-  import { createApp } from 'vue'
+-  import { initApp } from './init'
+-  import Navbar from './Navbar.vue'
+-  import ClientCard from './ClientCard.vue'
+-  import ResourceCard from './ResourceCard.vue'
+-  import ApolloVersion from './apollo_version'
+-
+-  console.log("Hello, Apollo!")
+-  let app = createApp({
+-    components: {
+-      Navbar,
+-      ClientCard,
+-      ResourceCard
+-    },
+-    data() {
+-      return {
+-        version: null,
+-        githubVersion: null,
+-        notifyPreReleases: false,
+-        preReleaseVersion: null,
+-        loading: true,
+-        logs: null,
+-      }
+-    },
+-    async created() {
+-      try {
+-        let config = await fetch("./api/config").then((r) => r.json());
+-        this.notifyPreReleases = config.notify_pre_releases;
+-        this.version = new ApolloVersion(null, config.version);
+-        console.log("Version: ", this.version.version)
+-        this.githubVersion = new ApolloVersion(await fetch("https://api.github.com/repos/ClassicOldSong/Apollo/releases/latest").then((r) => r.json()), null);
+-        console.log("GitHub Version: ", this.githubVersion.version)
+-        if (this.githubVersion) {
+-          this.preReleaseVersion = new ApolloVersion((await fetch("https://api.github.com/repos/ClassicOldSong/Apollo/releases").then((r) => r.json())).find(release => release.prerelease), null);
+-          console.log("Pre-Release Version: ", this.preReleaseVersion.version)
+-        }
+-      } catch (e) {
+-        console.error(e);
+-      }
+-      try {
+-        this.logs = (await fetch("./api/logs").then(r => r.text()))
+-      } catch (e) {
+-        console.error(e);
+-      }
+-      this.loading = false;
+-    },
+-    computed: {
+-      installedVersionNotStable() {
+-        if (!this.githubVersion || !this.version) {
+-          return false;
+-        }
+-        return this.version.isGreater(this.githubVersion);
+-      },
+-      stableBuildAvailable() {
+-        if (!this.githubVersion || !this.version) {
+-          return false;
+-        }
+-        return this.githubVersion.isGreater(this.version);
+-      },
+-      preReleaseBuildAvailable() {
+-        if (!this.preReleaseVersion || !this.githubVersion || !this.version) {
+-          return false;
+-        }
+-        return this.preReleaseVersion.isGreater(this.version, true) && this.preReleaseVersion.isGreater(this.githubVersion, true);
+-      },
+-      buildVersionIsDirty() {
+-        return this.version.version?.split(".").length === 5 &&
+-          this.version.version.indexOf("dirty") !== -1
+-      },
+-      /** Parse the text errors, calculating the text, the timestamp and the level */
+-      fancyLogs() {
+-        if (!this.logs) return [];
+-        let regex = /(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}]):\s/g;
+-        let rawLogLines = (this.logs.split(regex)).splice(1);
+-        let logLines = []
+-        for (let i = 0; i < rawLogLines.length; i += 2) {
+-          logLines.push({ timestamp: rawLogLines[i], level: rawLogLines[i + 1].split(":")[0], value: rawLogLines[i + 1] });
+-        }
+-        return logLines;
+-      }
+-    }
+-  });
+-
+-  initApp(app);
+-</script>
++</html>
+diff --git a/src_assets/common/assets/web/pin.html b/src_assets/common/assets/web/pin.html
+index d3fc5a65..579bf27b 100644
+--- a/src_assets/common/assets/web/pin.html
++++ b/src_assets/common/assets/web/pin.html
+@@ -18,9 +18,14 @@
+ 
+ <body id="app" v-cloak>
+   <Navbar></Navbar>
+-  <div id="content" class="container content-container d-flex flex-column align-items-center">
++  <div id="content" class="container-fluid duvo-content">
++    <div class="duvo-heading">
++      <h1>{{ $t('pin.duvo_title') }}</h1>
++      <p class="text-secondary">{{ $t('pin.duvo_subtitle') }}</p>
++    </div>
++    <div class="duvo-row">
+     <!-- ORBIT: phone pairing QR -->
+-    <div class="card p-4 mb-4 align-items-center" id="orbit-qr-card">
++    <div class="card p-4 duvo-qr align-items-center" id="orbit-qr-card">
+       <h2 class="mb-3">{{ $t('pin.orbit_qr_title') }}</h2>
+       <div v-show="orbitUri" id="orbitQrRef"></div>
+       <p v-if="orbitUri" class="text-secondary mb-2">
+@@ -31,82 +36,8 @@
+       <button class="btn btn-primary" type="button" @click="generateOrbitQR">{{ orbitUri ? $t('pin.orbit_qr_regenerate') : $t('pin.orbit_qr_generate') }}</button>
+       <p class="text-secondary mt-3 mb-0">{{ $t('pin.orbit_qr_hint') }}</p>
+     </div>
+-    <!-- ORBIT: reverse mode (phone screen on the PC via adb + scrcpy) -->
+-    <div class="card p-4 mb-4" id="orbit-reverse-card" style="max-width: 640px; width: 100%">
+-      <h2 class="mb-2">{{ $t('pin.orbit_rev_title') }}</h2>
+-      <p class="text-secondary">{{ $t('pin.orbit_rev_hint') }}</p>
+-      <div v-if="rev.tools && (!rev.tools.adb || !rev.tools.scrcpy)" class="alert alert-warning">{{ $t('pin.orbit_rev_missing') }}</div>
+-      <div v-if="rev.msg" class="alert alert-info" style="white-space: pre-wrap">{{ rev.msg }}</div>
+-      <div class="d-flex align-items-center mb-2">
+-        <strong class="flex-grow-1">{{ $t('pin.orbit_rev_title') }}</strong>
+-        <button class="btn btn-sm btn-outline-secondary" type="button" @click="revRefresh">{{ $t('pin.orbit_rev_refresh') }}</button>
+-      </div>
+-      <p v-if="!rev.devices.length" class="text-secondary">{{ $t('pin.orbit_rev_none') }}</p>
+-      <ul class="list-group mb-3" v-if="rev.devices.length">
+-        <li v-for="d in rev.devices" class="list-group-item d-flex align-items-center">
+-          <span class="flex-grow-1">{{ d.model || d.serial }} <small class="text-secondary">{{ d.serial }}</small>
+-            <small v-if="d.state === 'unauthorized'" class="text-danger d-block">{{ $t('pin.orbit_rev_unauthorized') }}</small>
+-          </span>
+-          <button v-if="d.state === 'device' && !rev.running.includes(d.serial)" class="btn btn-sm btn-primary" type="button" @click="revStart(d.serial)">{{ $t('pin.orbit_rev_open') }}</button>
+-          <button v-if="rev.running.includes(d.serial)" class="btn btn-sm btn-outline-danger" type="button" @click="revStop(d.serial)">{{ $t('pin.orbit_rev_close') }}</button>
+-        </li>
+-      </ul>
+-      <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-audio" v-model="rev.audio"><label class="form-check-label" for="rev-audio">{{ $t('pin.orbit_rev_audio') }}</label></div>
+-      <div class="form-check mb-3"><input class="form-check-input" type="checkbox" id="rev-off" v-model="rev.screenOff"><label class="form-check-label" for="rev-off">{{ $t('pin.orbit_rev_screen_off') }}</label></div>
+-      <h3 class="h6">{{ $t('pin.orbit_rev_pair_title') }}</h3>
+-      <p class="text-secondary small">{{ $t('pin.orbit_rev_pair_hint') }}</p>
+-      <div class="input-group mb-3">
+-        <input class="form-control" v-model="rev.pairAddr" :placeholder="$t('pin.orbit_rev_addr')">
+-        <input class="form-control" v-model="rev.pairCode" :placeholder="$t('pin.orbit_rev_code')" maxlength="6">
+-        <button class="btn btn-outline-primary" type="button" @click="revPair">{{ $t('pin.orbit_rev_pair') }}</button>
+-      </div>
+-      <h3 class="h6">{{ $t('pin.orbit_rev_connect_title') }}</h3>
+-      <p class="text-secondary small">{{ $t('pin.orbit_rev_connect_hint') }}</p>
+-      <div class="input-group">
+-        <input class="form-control" v-model="rev.connectAddr" :placeholder="$t('pin.orbit_rev_addr')">
+-        <button class="btn btn-outline-primary" type="button" @click="revConnect">{{ $t('pin.orbit_rev_connect') }}</button>
+-      </div>
+-    </div>
+-    <ul class="nav nav-pills pin-tab-bar justify-content-center">
+-      <li class="nav-item">
+-        <a class="nav-link" :class="{active: currentTab !== '#PIN'}" href="#OTP" @click.prevent="switchTab('OTP')">{{ $t('pin.otp_pairing') }}</a>
+-      </li>
+-      <li class="nav-item">
+-        <a class="nav-link" :class="{active: currentTab === '#PIN'}" href="#PIN" @click.prevent="switchTab('PIN')">{{ $t('pin.pin_pairing') }}</a>
+-      </li>
+-    </ul>
+-    <form v-if="currentTab === '#PIN'" class="form d-flex flex-column align-items-center" id="form" @submit.prevent="registerDevice">
+-      <div class="card flex-column d-flex p-4 mb-4">
+-        <input type="text" pattern="\d*" :placeholder="`${$t('navbar.pin')}`" autofocus id="pin-input" class="form-control mt-2" required />
+-        <input type="text" :placeholder="`${$t('pin.device_name')}`" id="name-input" class="form-control my-4" />
+-        <button class="btn btn-primary">{{ $t('pin.send') }}</button>
+-      </div>
+-      <div id="status"></div>
+-    </form>
+-    <form v-else class="form d-flex flex-column align-items-center" @submit.prevent="requestOTP">
+-      <div class="card flex-column d-flex p-4 mb-4">
+-        <div v-show="editingHost || (otp && hostAddr)" id="qrRef"></div>
+-        <p v-if="editingHost || (otp && hostAddr)" class="text-center text-secondary"><a class="text-secondary" :href="deepLink">art://{{ hostAddr }}:{{ hostPort }}</a> <i class="fas fa-fw fa-pen-to-square" @click="editHost"></i></p>
+-        <h1 class="mb-4 text-center">{{ otp && otp || '????' }}</h1>
+-        <div v-if="editingHost" class="d-flex flex-column align-items-stretch">
+-          <input type="text" placeholder="HOST" v-model="hostAddr" autofocus class="form-control mt-2" />
+-          <input type="text" placeholder="PORT" v-model="hostPort" class="form-control my-4" />
+-          <button class="btn btn-primary" :disabled="!this.canSaveHost" @click.prevent="saveHost">{{ $t('_common.save') }}</button>
+-        </div>
+-        <div v-else class="d-flex flex-column align-items-stretch">
+-          <input type="text" pattern="[0-9a-zA-Z]{4,}" :placeholder="`${$t('pin.otp_passphrase')}`" v-model="passphrase" required autofocus class="form-control mt-2" />
+-          <input type="text" :placeholder="`${$t('pin.device_name')}`" v-model="deviceName" class="form-control my-4" />
+-          <button class="btn btn-primary">{{ $t('pin.generate_pin') }}</button>
+-        </div>
+-      </div>
+-      <div v-if="otpMessage" class="alert" :class="['alert-' + otpStatus]">{{ otpMessage }}</div>
+-      <div class="alert alert-info">{{ $t('pin.otp_msg') }}</div>
+-    </form>
+-    <div class="alert alert-warning">
+-      <b>{{ $t('_common.warning') }}</b> {{ $t('pin.warning_msg') }}
+-    </div>
+     <!-- Manage Clients -->
+-    <div class="card my-4 align-self-stretch">
++    <div class="card duvo-clients">
+       <div class="card-body">
+         <div class="p-2">
+           <div class="d-flex justify-content-end align-items-center">
+@@ -259,6 +190,86 @@
+         <div class="list-group-item p-3 text-center"><em>{{ $t('pin.unpair_single_no_devices') }}</em></div>
+       </ul>
+     </div>
++    </div>
++    <!-- ORBIT: reverse mode (phone screen on the PC via adb + scrcpy) -->
++    <div class="card p-4 mb-4" id="orbit-reverse-card">
++      <h2 class="mb-2">{{ $t('pin.orbit_rev_title') }}</h2>
++      <p class="text-secondary">{{ $t('pin.orbit_rev_hint') }}</p>
++      <div v-if="rev.tools && (!rev.tools.adb || !rev.tools.scrcpy)" class="alert alert-warning">{{ $t('pin.orbit_rev_missing') }}</div>
++      <div v-if="rev.msg" class="alert alert-info" style="white-space: pre-wrap">{{ rev.msg }}</div>
++      <div class="d-flex align-items-center mb-2">
++        <strong class="flex-grow-1">{{ $t('pin.orbit_rev_title') }}</strong>
++        <button class="btn btn-sm btn-outline-secondary" type="button" @click="revRefresh">{{ $t('pin.orbit_rev_refresh') }}</button>
++      </div>
++      <p v-if="!rev.devices.length" class="text-secondary">{{ $t('pin.orbit_rev_none') }}</p>
++      <ul class="list-group mb-3" v-if="rev.devices.length">
++        <li v-for="d in rev.devices" class="list-group-item d-flex align-items-center">
++          <span class="flex-grow-1">{{ d.model || d.serial }} <small class="text-secondary">{{ d.serial }}</small>
++            <small v-if="d.state === 'unauthorized'" class="text-danger d-block">{{ $t('pin.orbit_rev_unauthorized') }}</small>
++          </span>
++          <button v-if="d.state === 'device' && !rev.running.includes(d.serial)" class="btn btn-sm btn-primary" type="button" @click="revStart(d.serial)">{{ $t('pin.orbit_rev_open') }}</button>
++          <button v-if="rev.running.includes(d.serial)" class="btn btn-sm btn-outline-danger" type="button" @click="revStop(d.serial)">{{ $t('pin.orbit_rev_close') }}</button>
++        </li>
++      </ul>
++      <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-audio" v-model="rev.audio"><label class="form-check-label" for="rev-audio">{{ $t('pin.orbit_rev_audio') }}</label></div>
++      <div class="form-check mb-3"><input class="form-check-input" type="checkbox" id="rev-off" v-model="rev.screenOff"><label class="form-check-label" for="rev-off">{{ $t('pin.orbit_rev_screen_off') }}</label></div>
++      <h3 class="h6">{{ $t('pin.orbit_rev_pair_title') }}</h3>
++      <p class="text-secondary small">{{ $t('pin.orbit_rev_pair_hint') }}</p>
++      <div class="input-group mb-3">
++        <input class="form-control" v-model="rev.pairAddr" :placeholder="$t('pin.orbit_rev_addr')">
++        <input class="form-control" v-model="rev.pairCode" :placeholder="$t('pin.orbit_rev_code')" maxlength="6">
++        <button class="btn btn-outline-primary" type="button" @click="revPair">{{ $t('pin.orbit_rev_pair') }}</button>
++      </div>
++      <h3 class="h6">{{ $t('pin.orbit_rev_connect_title') }}</h3>
++      <p class="text-secondary small">{{ $t('pin.orbit_rev_connect_hint') }}</p>
++      <div class="input-group">
++        <input class="form-control" v-model="rev.connectAddr" :placeholder="$t('pin.orbit_rev_addr')">
++        <button class="btn btn-outline-primary" type="button" @click="revConnect">{{ $t('pin.orbit_rev_connect') }}</button>
++      </div>
++    </div>
++    <details class="duvo-advanced card p-3 mb-4">
++      <summary>{{ $t('pin.duvo_advanced') }}</summary>
++      <div class="d-flex flex-column align-items-center mt-3">
++    <ul class="nav nav-pills pin-tab-bar justify-content-center">
++      <li class="nav-item">
++        <a class="nav-link" :class="{active: currentTab !== '#PIN'}" href="#OTP" @click.prevent="switchTab('OTP')">{{ $t('pin.otp_pairing') }}</a>
++      </li>
++      <li class="nav-item">
++        <a class="nav-link" :class="{active: currentTab === '#PIN'}" href="#PIN" @click.prevent="switchTab('PIN')">{{ $t('pin.pin_pairing') }}</a>
++      </li>
++    </ul>
++    <form v-if="currentTab === '#PIN'" class="form d-flex flex-column align-items-center" id="form" @submit.prevent="registerDevice">
++      <div class="card flex-column d-flex p-4 mb-4">
++        <input type="text" pattern="\d*" :placeholder="`${$t('navbar.pin')}`" autofocus id="pin-input" class="form-control mt-2" required />
++        <input type="text" :placeholder="`${$t('pin.device_name')}`" id="name-input" class="form-control my-4" />
++        <button class="btn btn-primary">{{ $t('pin.send') }}</button>
++      </div>
++      <div id="status"></div>
++    </form>
++    <form v-else class="form d-flex flex-column align-items-center" @submit.prevent="requestOTP">
++      <div class="card flex-column d-flex p-4 mb-4">
++        <div v-show="editingHost || (otp && hostAddr)" id="qrRef"></div>
++        <p v-if="editingHost || (otp && hostAddr)" class="text-center text-secondary"><a class="text-secondary" :href="deepLink">art://{{ hostAddr }}:{{ hostPort }}</a> <i class="fas fa-fw fa-pen-to-square" @click="editHost"></i></p>
++        <h1 class="mb-4 text-center">{{ otp && otp || '????' }}</h1>
++        <div v-if="editingHost" class="d-flex flex-column align-items-stretch">
++          <input type="text" placeholder="HOST" v-model="hostAddr" autofocus class="form-control mt-2" />
++          <input type="text" placeholder="PORT" v-model="hostPort" class="form-control my-4" />
++          <button class="btn btn-primary" :disabled="!this.canSaveHost" @click.prevent="saveHost">{{ $t('_common.save') }}</button>
++        </div>
++        <div v-else class="d-flex flex-column align-items-stretch">
++          <input type="text" pattern="[0-9a-zA-Z]{4,}" :placeholder="`${$t('pin.otp_passphrase')}`" v-model="passphrase" required autofocus class="form-control mt-2" />
++          <input type="text" :placeholder="`${$t('pin.device_name')}`" v-model="deviceName" class="form-control my-4" />
++          <button class="btn btn-primary">{{ $t('pin.generate_pin') }}</button>
++        </div>
++      </div>
++      <div v-if="otpMessage" class="alert" :class="['alert-' + otpStatus]">{{ otpMessage }}</div>
++      <div class="alert alert-info">{{ $t('pin.otp_msg') }}</div>
++    </form>
++    <div class="alert alert-warning">
++      <b>{{ $t('_common.warning') }}</b> {{ $t('pin.warning_msg') }}
++    </div>
++      </div>
++    </details>
+   </div>
+ </body>
+ 
+@@ -486,6 +497,7 @@
+     created() {
+       this.refreshClients();
+       this.revRefresh();
++      this.generateOrbitQR();
+     },
+     methods: {
+       switchTab(currentTab) {
+diff --git a/src_assets/common/assets/web/public/assets/css/duvo.css b/src_assets/common/assets/web/public/assets/css/duvo.css
+index 573779f9..f1a72f1c 100644
+--- a/src_assets/common/assets/web/public/assets/css/duvo.css
++++ b/src_assets/common/assets/web/public/assets/css/duvo.css
+@@ -117,3 +117,25 @@ html code, html kbd, html pre, html .font-monospace { font-family: var(--bs-font
+ 
+ html .alert-info { --bs-alert-bg: var(--bs-secondary-bg); --bs-alert-color: var(--bs-body-color); --bs-alert-border-color: var(--bs-border-color); }
+ html .alert-warning { --bs-alert-bg: var(--bs-primary-bg-subtle); --bs-alert-color: var(--bs-primary-text-emphasis); --bs-alert-border-color: var(--bs-primary-border-subtle); }
++
++/* Sidebar layout (wide screens): brand and navigation on the left, as in the concept. */
++html .duvo-content { max-width: 1280px; padding: 36px 40px; }
++html .duvo-heading h1 { font-size: 28px; margin: 0 0 4px; }
++html .duvo-row { display: flex; flex-wrap: wrap; gap: 20px; align-items: stretch; margin-bottom: 20px; }
++html .duvo-qr { flex: 0 0 300px; box-sizing: border-box; }
++html .duvo-clients { flex: 1 1 420px; min-width: 0; }
++html .duvo-advanced summary { cursor: pointer; font-weight: 500; }
++html .navbar .nav-link { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 12px; border-radius: 12px; color: var(--bs-secondary-color); font-weight: 500; }
++html .navbar .nav-link:hover { color: var(--bs-body-color); background: var(--bs-secondary-bg); }
++html .navbar .nav-link.active { color: var(--bs-body-color); background: var(--bs-secondary-bg); font-weight: 600; }
++html .navbar .nav-link i { width: 20px; text-align: center; }
++html .duvo-sidebar-foot { margin-top: auto; padding: 12px 0 0; }
++@media (min-width: 992px) {
++  html body { padding-left: 232px; }
++  html .navbar { position: fixed; top: 0; bottom: 0; left: 0; width: 232px; padding: 28px 16px; border-bottom: none; border-right: 1px solid var(--bs-border-color); z-index: 1030; align-items: stretch; }
++  html .navbar > .container { flex-direction: column; align-items: stretch; flex-wrap: nowrap; padding: 0; max-width: none; height: 100%; }
++  html .navbar .navbar-brand { padding: 0 12px 20px; font-size: 19px; }
++  html .navbar .navbar-collapse { display: flex !important; flex-direction: column; flex-grow: 1; }
++  html .navbar .navbar-nav { flex-direction: column; gap: 6px; width: 100%; }
++  html .navbar .navbar-toggler { display: none; }
++}
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index 09d07492..30007068 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -481,9 +481,9 @@
+   },
+   "navbar": {
+     "applications": "Applications",
+-    "configuration": "Configuration",
+-    "home": "Home",
+-    "password": "Change Password",
++    "configuration": "Settings",
++    "home": "Devices",
++    "password": "Change password",
+     "pin": "PIN",
+     "theme_auto": "Auto",
+     "theme_dark": "Dark",
+@@ -590,7 +590,10 @@
+     "orbit_rev_unauthorized": "Accept the debugging prompt on the phone.",
+     "orbit_rev_audio": "Phone audio on the PC",
+     "orbit_rev_screen_off": "Turn the phone screen off",
+-    "orbit_rev_failed": "Failed"
++    "orbit_rev_failed": "Failed",
++    "duvo_title": "Devices",
++    "duvo_subtitle": "Who can control this PC, and how far.",
++    "duvo_advanced": "Advanced: pair with a PIN or a Moonlight client"
+   },
+   "resource_card": {
+     "github_discussions": "GitHub Discussions",
+diff --git a/src_assets/common/assets/web/public/assets/locale/pt_BR.json b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+index 8f2a5054..4747364a 100644
+--- a/src_assets/common/assets/web/public/assets/locale/pt_BR.json
++++ b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+@@ -441,15 +441,15 @@
+   },
+   "navbar": {
+     "applications": "Aplicativos",
+-    "configuration": "Configuração",
+-    "home": "Início",
++    "configuration": "Configurações",
++    "home": "Aparelhos",
+     "password": "Alterar senha",
+     "pin": "PIN",
+     "theme_auto": "Automático",
+     "theme_dark": "Escuro",
+     "theme_light": "Claro",
+     "toggle_theme": "Tema",
+-    "troubleshoot": "Solução de Problemas"
++    "troubleshoot": "Solução de problemas"
+   },
+   "password": {
+     "confirm_password": "Confirmar senha",
+@@ -544,7 +544,10 @@
+     "orbit_rev_unauthorized": "Aceite o aviso de depuração no celular.",
+     "orbit_rev_audio": "Som do celular no PC",
+     "orbit_rev_screen_off": "Apagar a tela do celular",
+-    "orbit_rev_failed": "Falhou"
++    "orbit_rev_failed": "Falhou",
++    "duvo_title": "Aparelhos",
++    "duvo_subtitle": "Quem pode controlar este PC, e até onde.",
++    "duvo_advanced": "Avançado: parear com PIN ou com um cliente Moonlight"
+   },
+   "resource_card": {
+     "github_discussions": "Discussões no GitHub",
+-- 
+2.55.0.windows.5
+

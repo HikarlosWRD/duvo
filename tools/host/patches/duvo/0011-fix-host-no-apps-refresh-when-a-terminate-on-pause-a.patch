@@ -1,0 +1,38 @@
+From 6bd8792b9419f3a06f65771ad55447c3a86c5010 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:44:11 -0300
+Subject: [PATCH 11/28] fix(host): no apps refresh when a terminate-on-pause
+ app ends
+
+proc_t::pause() runs inside stream::session::join(), under its 10 s hang
+watchdog. For terminate_on_pause apps (the input-only "Remote Input"
+app) it called terminate(), whose refresh() retries the SudoVDA driver
+5 times (~11 s) when it is not installed: every end of the last
+input-only session aborted the host ("Hang detected! Session failed to
+terminate in 10 seconds"). Terminate without the refresh, as execute()
+already does; the app list does not change on pause.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/process.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/process.cpp b/src/process.cpp
+index d7d4af4b..73d3e5b1 100644
+--- a/src/process.cpp
++++ b/src/process.cpp
+@@ -653,7 +653,10 @@ namespace proc {
+ 
+     if (_app.terminate_on_pause) {
+       BOOST_LOG(info) << "Terminating app [" << _app_name << "] when all clients are disconnected. Pause commands are skipped.";
+-      terminate();
++      // ORBIT: no apps refresh here. pause() runs inside stream::session::join(), under its 10 s hang
++      // watchdog, and refresh() retries the SudoVDA driver 5 times (~11 s) when it is not installed:
++      // every input-only session end then aborted the host. The app list does not change on pause.
++      terminate(false, false);
+       return;
+     }
+ 
+-- 
+2.55.0.windows.5
+

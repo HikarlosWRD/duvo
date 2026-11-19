@@ -1,0 +1,371 @@
+From 962dc1bac0777f4910a2bcee3c50a4822be697bb Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:16:03 -0300
+Subject: [PATCH 02/28] feat(orbit): own mDNS service, base port 40989, QR pair
+ URI
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake |  4 ++
+ src/config.cpp                         |  3 +-
+ src/orbit/orbit_config.cpp             | 24 +++++++
+ src/orbit/orbit_config.h               | 30 +++++++++
+ src/orbit/pair_qr.cpp                  | 88 ++++++++++++++++++++++++++
+ src/orbit/pair_qr.h                    | 46 ++++++++++++++
+ src/platform/windows/publish.cpp       |  3 +-
+ tests/unit/test_orbit_config.cpp       | 15 +++++
+ tests/unit/test_pair_qr.cpp            | 47 ++++++++++++++
+ 9 files changed, 258 insertions(+), 2 deletions(-)
+ create mode 100644 src/orbit/orbit_config.cpp
+ create mode 100644 src/orbit/orbit_config.h
+ create mode 100644 src/orbit/pair_qr.cpp
+ create mode 100644 src/orbit/pair_qr.h
+ create mode 100644 tests/unit/test_orbit_config.cpp
+ create mode 100644 tests/unit/test_pair_qr.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index f3873305..abc72e41 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -102,6 +102,10 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/process.h"
+         "${CMAKE_SOURCE_DIR}/src/network.cpp"
+         "${CMAKE_SOURCE_DIR}/src/network.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/orbit_config.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/orbit_config.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/pair_qr.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/pair_qr.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/src/config.cpp b/src/config.cpp
+index 6892e302..9fcb81b5 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -19,6 +19,7 @@
+ #include <boost/property_tree/ptree.hpp>
+ 
+ // local includes
++#include "orbit/orbit_config.h"  // ORBIT: default port
+ #include "config.h"
+ #include "entry_handler.h"
+ #include "file_handler.h"
+@@ -592,7 +593,7 @@ namespace config {
+     {},  // Password Salt
+     platf::appdata().string() + "/sunshine.conf",  // config file
+     {},  // cmd args
+-    47989,  // Base port number
++    orbit::kDefaultBasePort,  // Base port number // ORBIT: was 47989
+     "ipv4",  // Address family
+     platf::appdata().string() + "/sunshine.log",  // log file
+     false,  // notify_pre_releases
+diff --git a/src/orbit/orbit_config.cpp b/src/orbit/orbit_config.cpp
+new file mode 100644
+index 00000000..7f8e1fb2
+--- /dev/null
++++ b/src/orbit/orbit_config.cpp
+@@ -0,0 +1,24 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/orbit_config.cpp
++ * @brief Orbit identity constants are header-only; this unit anchors the module.
++ */
++#include "orbit_config.h"
++
++static_assert(orbit::kDefaultBasePort > 1024 && orbit::kDefaultBasePort < 65000, "invalid Orbit base port");
+diff --git a/src/orbit/orbit_config.h b/src/orbit/orbit_config.h
+new file mode 100644
+index 00000000..b878202d
+--- /dev/null
++++ b/src/orbit/orbit_config.h
+@@ -0,0 +1,30 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/orbit_config.h
++ * @brief Orbit identity constants (default base port and mDNS service type).
++ */
++#pragma once
++
++// Literal form, usable in string-literal concatenation (e.g. wide mDNS name).
++#define ORBIT_MDNS_SERVICE "_orbit._tcp"
++
++namespace orbit {
++  constexpr int kDefaultBasePort = 40989;
++  constexpr const char *kMdnsService = ORBIT_MDNS_SERVICE;
++}  // namespace orbit
+diff --git a/src/orbit/pair_qr.cpp b/src/orbit/pair_qr.cpp
+new file mode 100644
+index 00000000..ac6f30c7
+--- /dev/null
++++ b/src/orbit/pair_qr.cpp
+@@ -0,0 +1,88 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/pair_qr.cpp
++ * @brief Pairing QR payload and usable-IPv4 selection for Orbit.
++ */
++#include "pair_qr.h"
++
++#include <algorithm>
++#include <cctype>
++
++namespace orbit {
++  namespace {
++    bool icontains(const std::string &hay, const std::string &needle) {
++      auto it = std::search(hay.begin(), hay.end(), needle.begin(), needle.end(), [](unsigned char a, unsigned char b) {
++        return std::tolower(a) == std::tolower(b);
++      });
++      return it != hay.end();
++    }
++
++    bool is_virtual(const std::string &name) {
++      for (const char *v : {"vEthernet", "VirtualBox", "VMware", "WSL", "Hyper-V"}) {
++        if (icontains(name, v)) {
++          return true;
++        }
++      }
++      return false;
++    }
++
++    bool is_link_local(const std::string &ip) {
++      return ip.rfind("169.254.", 0) == 0;
++    }
++  }  // namespace
++
++  std::vector<std::string> usable_ipv4(const std::vector<Adapter> &adapters) {
++    std::vector<std::string> out;
++    for (auto kind : {Adapter::Kind::Ethernet, Adapter::Kind::WiFi, Adapter::Kind::Other}) {
++      for (const auto &a : adapters) {
++        if (a.kind != kind || !a.up || a.loopback || a.ipv4.empty() || is_link_local(a.ipv4) || is_virtual(a.name)) {
++          continue;
++        }
++        out.push_back(a.ipv4);
++      }
++    }
++    return out;
++  }
++
++  static std::string url_encode(const std::string &s) {
++    static const char *hex = "0123456789ABCDEF";
++    std::string out;
++    for (unsigned char c : s) {
++      if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
++        out += static_cast<char>(c);
++      } else {
++        out += '%';
++        out += hex[c >> 4];
++        out += hex[c & 0xF];
++      }
++    }
++    return out;
++  }
++
++  std::string build_pair_uri(const std::vector<std::string> &ips, int port, const std::string &otp, const std::string &cert_sha256_hex, const std::string &host_name) {
++    std::string h;
++    for (size_t i = 0; i < ips.size(); ++i) {
++      if (i) {
++        h += ',';
++      }
++      h += ips[i];
++    }
++    return "orbit://pair?v=1&h=" + h + "&p=" + std::to_string(port) + "&otp=" + otp + "&fp=" + cert_sha256_hex + "&n=" + url_encode(host_name);
++  }
++}  // namespace orbit
+diff --git a/src/orbit/pair_qr.h b/src/orbit/pair_qr.h
+new file mode 100644
+index 00000000..cf8e802e
+--- /dev/null
++++ b/src/orbit/pair_qr.h
+@@ -0,0 +1,46 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/pair_qr.h
++ * @brief Pairing QR payload and usable-IPv4 selection for Orbit.
++ */
++#pragma once
++
++#include <string>
++#include <vector>
++
++namespace orbit {
++  struct Adapter {
++    std::string name;
++    std::string ipv4;
++    bool up;
++    bool loopback;
++    enum class Kind { Ethernet, WiFi, Other } kind;
++  };
++
++  /**
++   * @brief Filter adapters to those usable for pairing: up, not loopback, not link-local
++   *        (169.254/16), not a known virtual adapter. Ethernet first, then Wi-Fi, then Other.
++   */
++  std::vector<std::string> usable_ipv4(const std::vector<Adapter> &adapters);
++
++  /**
++   * @brief Build orbit://pair?v=1&h=<ips>&p=<port>&otp=<otp>&fp=<sha256hex>&n=<url-encoded name>
++   */
++  std::string build_pair_uri(const std::vector<std::string> &ips, int port, const std::string &otp, const std::string &cert_sha256_hex, const std::string &host_name);
++}  // namespace orbit
+diff --git a/src/platform/windows/publish.cpp b/src/platform/windows/publish.cpp
+index 600253de..749fd44d 100644
+--- a/src/platform/windows/publish.cpp
++++ b/src/platform/windows/publish.cpp
+@@ -16,6 +16,7 @@
+ #include "src/config.h"
+ #include "src/logging.h"
+ #include "src/network.h"
++#include "src/orbit/orbit_config.h"  // ORBIT: mDNS service type
+ #include "src/nvhttp.h"
+ #include "src/platform/common.h"
+ #include "src/thread_safe.h"
+@@ -38,7 +39,7 @@ extern "C" {
+ 
+ #define SERVICE_DOMAIN "local"
+ 
+-  constexpr auto SERVICE_TYPE_DOMAIN = SV(SERVICE_TYPE "." SERVICE_DOMAIN);
++  constexpr auto SERVICE_TYPE_DOMAIN = SV(ORBIT_MDNS_SERVICE "." SERVICE_DOMAIN);  // ORBIT: was SERVICE_TYPE (_nvstream._tcp)
+ 
+ #ifndef __MINGW32__
+   typedef struct _DNS_SERVICE_INSTANCE {
+diff --git a/tests/unit/test_orbit_config.cpp b/tests/unit/test_orbit_config.cpp
+new file mode 100644
+index 00000000..ff43e36e
+--- /dev/null
++++ b/tests/unit/test_orbit_config.cpp
+@@ -0,0 +1,15 @@
++/**
++ * @file tests/unit/test_orbit_config.cpp
++ * @brief Test src/orbit/orbit_config.h
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/orbit_config.h>
++
++TEST(OrbitConfig, DefaultPort) {
++  EXPECT_EQ(orbit::kDefaultBasePort, 40989);
++}
++
++TEST(OrbitConfig, ServiceName) {
++  EXPECT_STREQ(orbit::kMdnsService, "_orbit._tcp");
++}
+diff --git a/tests/unit/test_pair_qr.cpp b/tests/unit/test_pair_qr.cpp
+new file mode 100644
+index 00000000..1cba56b2
+--- /dev/null
++++ b/tests/unit/test_pair_qr.cpp
+@@ -0,0 +1,47 @@
++/**
++ * @file tests/unit/test_pair_qr.cpp
++ * @brief Test src/orbit/pair_qr.*
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/pair_qr.h>
++
++using orbit::Adapter;
++
++TEST(PairQr, UsableIpsFiltersVirtualAndLinkLocal) {
++  std::vector<Adapter> in {
++    {"Wi-Fi", "192.168.0.11", true, false, Adapter::Kind::WiFi},
++    {"vEthernet (WSL)", "172.20.0.1", true, false, Adapter::Kind::Ethernet},
++    {"Ethernet", "192.168.0.10", true, false, Adapter::Kind::Ethernet},
++    {"Ethernet 2", "169.254.3.4", true, false, Adapter::Kind::Ethernet},
++    {"Loopback", "127.0.0.1", true, true, Adapter::Kind::Other},
++    {"Ethernet 3", "10.0.0.5", false, false, Adapter::Kind::Ethernet},
++    {"VMware Network Adapter", "192.168.56.1", true, false, Adapter::Kind::Other},
++  };
++  EXPECT_EQ(orbit::usable_ipv4(in), (std::vector<std::string> {"192.168.0.10", "192.168.0.11"}));
++}
++
++TEST(PairQr, OrdersEthernetWifiOtherKeepingInputOrder) {
++  std::vector<Adapter> in {
++    {"Other", "10.0.0.9", true, false, Adapter::Kind::Other},
++    {"Wi-Fi", "192.168.0.11", true, false, Adapter::Kind::WiFi},
++    {"Eth A", "192.168.0.10", true, false, Adapter::Kind::Ethernet},
++    {"Eth B", "192.168.0.12", true, false, Adapter::Kind::Ethernet},
++  };
++  EXPECT_EQ(orbit::usable_ipv4(in), (std::vector<std::string> {"192.168.0.10", "192.168.0.12", "192.168.0.11", "10.0.0.9"}));
++}
++
++TEST(PairQr, BuildsUri) {
++  std::string fp(64, 'a');
++  for (size_t i = 1; i < fp.size(); i += 2) {
++    fp[i] = 'b';
++  }
++  EXPECT_EQ(
++    orbit::build_pair_uri({"192.168.0.10", "192.168.0.11"}, 40989, "1234", fp, "PC Sala"),
++    "orbit://pair?v=1&h=192.168.0.10,192.168.0.11&p=40989&otp=1234&fp=" + fp + "&n=PC%20Sala"
++  );
++}
++
++TEST(PairQr, EncodesUtf8Name) {
++  EXPECT_EQ(orbit::build_pair_uri({"1.2.3.4"}, 1, "0", "ab", "Cão-1_~.x"), "orbit://pair?v=1&h=1.2.3.4&p=1&otp=0&fp=ab&n=C%C3%A3o-1_~.x");
++}
+-- 
+2.55.0.windows.5
+

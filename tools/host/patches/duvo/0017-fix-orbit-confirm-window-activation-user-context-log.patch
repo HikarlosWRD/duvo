@@ -1,0 +1,720 @@
+From 39482025d5b2365e0532676f9926ea0539cb3a83 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:39:58 -0300
+Subject: [PATCH 17/28] fix(orbit): confirm window activation, user-context
+ logoff, absolute tool paths
+
+Activate and power decisions move to win_actions.cpp over a thin Win32Ops seam (fakes in tests).
+Activate now only accepts visible top-level windows not owned by the host (else not_found) and, after
+SetForegroundWindow returns TRUE, polls GetAncestor(GetForegroundWindow(), GA_ROOT) for up to 300 ms
+in 20 ms steps; if the target never becomes the foreground (e.g. a full-screen game keeps it) it answers
+denied and logs it. Logoff as SYSTEM runs <system32>\shutdown.exe /l in the user's session instead of the
+forced WTSLogoffSession, so apps can still veto. explorer.exe, rundll32.exe and shutdown.exe are started
+by absolute path (GetSystemWindowsDirectoryW / GetSystemDirectoryW).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake |   2 +
+ src/orbit/platform_windows_win.cpp     | 243 +++++++++++++++----------
+ src/orbit/win_actions.cpp              |  92 ++++++++++
+ src/orbit/win_actions.h                |  76 ++++++++
+ tests/unit/test_win_actions.cpp        | 191 +++++++++++++++++++
+ 5 files changed, 512 insertions(+), 92 deletions(-)
+ create mode 100644 src/orbit/win_actions.cpp
+ create mode 100644 src/orbit/win_actions.h
+ create mode 100644 tests/unit/test_win_actions.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 3f2938bc..0950b9b9 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -125,6 +125,8 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/windows_api.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/power_api.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/power_api.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/win_actions.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/win_actions.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/src/orbit/platform_windows_win.cpp b/src/orbit/platform_windows_win.cpp
+index e85e57c3..39b8f1dc 100644
+--- a/src/orbit/platform_windows_win.cpp
++++ b/src/orbit/platform_windows_win.cpp
+@@ -23,14 +23,17 @@
+  * - Window list/activate/show desktop run on a short-lived thread attached to the input desktop
+  *   (platf::syncThreadDesktop, as Apollo's input code does), so they work in both cases.
+  * - Start Menu: the all-users folder plus the logged-in user's folder (resolved with the user's token when
+- *   running as SYSTEM). Shortcuts are opened with `explorer.exe "<lnk>"` through platf::run_command, which
+- *   already starts processes as the logged-in user when the host is SYSTEM. No extra helper is needed.
+- * - Lock as SYSTEM: `rundll32.exe user32.dll,LockWorkStation` via the same run_command path
+- *   (LockWorkStation only works from the user's interactive session). Logoff as SYSTEM: WTSLogoffSession.
++ *   running as SYSTEM). Shortcuts are opened with `<windir>\explorer.exe "<lnk>"` through platf::run_command,
++ *   which already starts processes as the logged-in user when the host is SYSTEM. No extra helper is needed.
++ * - Activate and power decisions live in win_actions.cpp (tested with a fake Win32Ops); WinOps below is the
++ *   real Win32 side. As SYSTEM, lock and logoff run `<system32>\rundll32.exe user32.dll,LockWorkStation` and
++ *   `<system32>\shutdown.exe /l` in the user's context (both only work from the user's session; logoff
++ *   stays non-forced, apps can veto).
+  * Nothing here throws; failures are logged and reported as false / denied.
+  */
+ #define BOOST_PROCESS_VERSION 1
+ #include "power_api.h"
++#include "win_actions.h"
+ #include "windows_api.h"
+ 
+ #include <boost/filesystem.hpp>
+@@ -45,7 +48,6 @@
+ #include <mmdeviceapi.h>
+ #include <shldisp.h>
+ #include <ShlObj.h>
+-#include <WtsApi32.h>
+ // clang-format on
+ 
+ #include "src/logging.h"
+@@ -266,6 +268,144 @@ namespace orbit {
+       return ok;
+     }
+ 
++    std::string dir_utf8(UINT(WINAPI *fn)(LPWSTR, UINT), const char *fallback) {
++      wchar_t buf[MAX_PATH];
++      UINT n = fn(buf, MAX_PATH);
++      if (n == 0 || n >= MAX_PATH) {
++        return fallback;
++      }
++      return platf::to_utf8(std::wstring_view {buf, n});
++    }
++
++    bool enable_shutdown_privilege() {
++      HANDLE token = nullptr;
++      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
++        return false;
++      }
++      TOKEN_PRIVILEGES tp {};
++      tp.PrivilegeCount = 1;
++      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++      bool ok = LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &tp.Privileges[0].Luid) &&
++                AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
++      CloseHandle(token);
++      return ok;
++    }
++
++    using set_suspend_state_fn = BOOLEAN(WINAPI *)(BOOLEAN, BOOLEAN, BOOLEAN);
++
++    constexpr DWORD kShutdownReason = SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED;
++
++    /// Real Win32 side of Win32Ops.
++    class WinOps: public Win32Ops {
++    public:
++      static HWND h(uint64_t id) {
++        return reinterpret_cast<HWND>(static_cast<uintptr_t>(id));
++      }
++
++      bool is_window(uint64_t id) override {
++        return IsWindow(h(id));
++      }
++
++      bool is_top_level(uint64_t id) override {
++        return GetAncestor(h(id), GA_ROOT) == h(id);
++      }
++
++      bool is_visible(uint64_t id) override {
++        return IsWindowVisible(h(id));
++      }
++
++      bool is_host_window(uint64_t id) override {
++        DWORD pid = 0;
++        GetWindowThreadProcessId(h(id), &pid);
++        return pid == GetCurrentProcessId();
++      }
++
++      bool higher_integrity(uint64_t id) override {
++        return orbit::higher_integrity(h(id));
++      }
++
++      bool is_minimized(uint64_t id) override {
++        return IsIconic(h(id));
++      }
++
++      void restore(uint64_t id) override {
++        // Async: a hung target must not block the API thread.
++        ShowWindowAsync(h(id), SW_RESTORE);
++      }
++
++      bool set_foreground(uint64_t id) override {
++        return SetForegroundWindow(h(id));
++      }
++
++      void nudge_foreground_lock() override {
++        // Empty (zero-move) mouse input: makes us the last-input process; harmless for the current app.
++        INPUT in {};
++        in.type = INPUT_MOUSE;
++        SendInput(1, &in, sizeof(in));
++      }
++
++      uint64_t foreground_root() override {
++        HWND fg = GetForegroundWindow();
++        HWND root = fg ? GetAncestor(fg, GA_ROOT) : nullptr;
++        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(root ? root : fg));
++      }
++
++      void sleep_ms(int ms) override {
++        std::this_thread::sleep_for(std::chrono::milliseconds {ms});
++      }
++
++      bool running_as_system() override {
++        return platf::is_running_as_system();
++      }
++
++      bool run_as_user(const std::string &cmd) override {
++        return orbit::run_as_user(cmd);
++      }
++
++      bool initiate_shutdown(bool reboot) override {
++        // Apps are not forced closed: one with unsaved work can still cancel.
++        return enable_shutdown_privilege() && InitiateSystemShutdownExW(nullptr, nullptr, 0, FALSE, reboot, kShutdownReason);
++      }
++
++      bool suspend() override {
++        // powrprof is loaded on demand (not in the link line). SetSuspendState blocks until resume, so it runs
++        // shortly after on a detached thread and the HTTP reply goes out first.
++        HMODULE lib = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        if (!lib) {
++          return false;
++        }
++        auto fn = reinterpret_cast<set_suspend_state_fn>(reinterpret_cast<void *>(GetProcAddress(lib, "SetSuspendState")));
++        if (!fn || !enable_shutdown_privilege()) {
++          FreeLibrary(lib);
++          return false;
++        }
++        std::thread([lib, fn]() {
++          std::this_thread::sleep_for(500ms);
++          if (!fn(FALSE, FALSE, FALSE)) {
++            BOOST_LOG(warning) << "[Orbit] SetSuspendState failed: "sv << GetLastError();
++          }
++          FreeLibrary(lib);
++        }).detach();
++        return true;
++      }
++
++      bool exit_windows_logoff() override {
++        return ExitWindowsEx(EWX_LOGOFF, kShutdownReason);
++      }
++
++      bool lock_workstation() override {
++        return LockWorkStation();
++      }
++
++      std::string system_dir() override {
++        return dir_utf8(&GetSystemDirectoryW, "C:\\Windows\\System32");
++      }
++
++      std::string windows_dir() override {
++        return dir_utf8(&GetSystemWindowsDirectoryW, "C:\\Windows");
++      }
++    };
++
+     class WinWindowPlatform: public WindowPlatform {
+     public:
+       std::vector<WindowInfo> list() override {
+@@ -278,33 +418,8 @@ namespace orbit {
+ 
+       ActivateResult activate(uint64_t id) override {
+         return on_input_desktop<ActivateResult>([id]() {
+-          HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(id));
+-          if (id == 0 || !IsWindow(hwnd)) {
+-            return ActivateResult::not_found;
+-          }
+-          if (higher_integrity(hwnd)) {
+-            return ActivateResult::denied;
+-          }
+-          if (IsIconic(hwnd)) {
+-            // Async: a hung target must not block the API thread.
+-            ShowWindowAsync(hwnd, SW_RESTORE);
+-            for (int i = 0; i < 20 && IsIconic(hwnd); ++i) {
+-              std::this_thread::sleep_for(10ms);
+-            }
+-          }
+-          if (SetForegroundWindow(hwnd)) {
+-            return ActivateResult::ok;
+-          }
+-          // Foreground lock: Windows only lets the process that got the last input event switch windows.
+-          // An empty (zero-move) mouse input makes us that process; harmless for the current app.
+-          INPUT in {};
+-          in.type = INPUT_MOUSE;
+-          SendInput(1, &in, sizeof(in));
+-          if (SetForegroundWindow(hwnd)) {
+-            return ActivateResult::ok;
+-          }
+-          BOOST_LOG(info) << "[Orbit] SetForegroundWindow refused for window "sv << id;
+-          return ActivateResult::denied;
++          WinOps os;
++          return activate_window(os, id);
+         });
+       }
+ 
+@@ -348,7 +463,8 @@ namespace orbit {
+         for (auto &a : start_menu()) {
+           if (a.id == id) {
+             BOOST_LOG(info) << "[Orbit] launching Start Menu shortcut ["sv << a.name << ']';
+-            return run_as_user("explorer.exe \"" + a.path + "\"");
++            WinOps os;
++            return run_as_user(quoted_path(os.windows_dir(), "explorer.exe") + " \"" + a.path + "\"");
+           }
+         }
+         return false;
+@@ -368,73 +484,16 @@ namespace orbit {
+       }
+     };
+ 
+-    bool enable_shutdown_privilege() {
+-      HANDLE token = nullptr;
+-      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+-        return false;
+-      }
+-      TOKEN_PRIVILEGES tp {};
+-      tp.PrivilegeCount = 1;
+-      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+-      bool ok = LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &tp.Privileges[0].Luid) &&
+-                AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+-      CloseHandle(token);
+-      return ok;
+-    }
+-
+-    constexpr DWORD kShutdownReason = SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED;
+-
+     class WinPowerPlatform: public PowerPlatform {
+     public:
+       bool run(PowerAction action) override {
+-        bool ok = false;
+-        switch (action) {
+-          case PowerAction::shutdown:
+-          case PowerAction::restart:
+-            // Apps are not forced closed: one with unsaved work can still cancel.
+-            ok = enable_shutdown_privilege() &&
+-                 InitiateSystemShutdownExW(nullptr, nullptr, 0, FALSE, action == PowerAction::restart, kShutdownReason);
+-            break;
+-          case PowerAction::sleep:
+-            ok = sleep();
+-            break;
+-          case PowerAction::logoff:
+-            ok = platf::is_running_as_system() ? WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, WTSGetActiveConsoleSessionId(), FALSE) : ExitWindowsEx(EWX_LOGOFF, kShutdownReason);
+-            break;
+-          case PowerAction::lock:
+-            ok = platf::is_running_as_system() ? run_as_user("rundll32.exe user32.dll,LockWorkStation") : LockWorkStation();
+-            break;
+-        }
++        WinOps os;
++        bool ok = run_power_action(os, action);
+         if (!ok) {
+           BOOST_LOG(warning) << "[Orbit] power "sv << power_action_name(action) << " failed: "sv << GetLastError();
+         }
+         return ok;
+       }
+-
+-    private:
+-      using set_suspend_state_fn = BOOLEAN(WINAPI *)(BOOLEAN, BOOLEAN, BOOLEAN);
+-
+-      static bool sleep() {
+-        // powrprof is loaded on demand (not in the link line). SetSuspendState blocks until resume, so it runs
+-        // shortly after on a detached thread and the HTTP reply goes out first.
+-        HMODULE lib = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+-        if (!lib) {
+-          return false;
+-        }
+-        auto fn = reinterpret_cast<set_suspend_state_fn>(reinterpret_cast<void *>(GetProcAddress(lib, "SetSuspendState")));
+-        if (!fn || !enable_shutdown_privilege()) {
+-          FreeLibrary(lib);
+-          return false;
+-        }
+-        std::thread([lib, fn]() {
+-          std::this_thread::sleep_for(500ms);
+-          if (!fn(FALSE, FALSE, FALSE)) {
+-            BOOST_LOG(warning) << "[Orbit] SetSuspendState failed: "sv << GetLastError();
+-          }
+-          FreeLibrary(lib);
+-        }).detach();
+-        return true;
+-      }
+     };
+   }  // namespace
+ 
+diff --git a/src/orbit/win_actions.cpp b/src/orbit/win_actions.cpp
+new file mode 100644
+index 00000000..b8cc0472
+--- /dev/null
++++ b/src/orbit/win_actions.cpp
+@@ -0,0 +1,92 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/win_actions.cpp
++ * @brief Window activation and power decisions (platform independent; Win32 calls go through Win32Ops).
++ */
++#include "win_actions.h"
++
++#include "src/logging.h"
++
++namespace orbit {
++  std::string quoted_path(const std::string &dir, const std::string &exe) {
++    return "\"" + dir + "\\" + exe + "\"";
++  }
++
++  ActivateResult activate_window(Win32Ops &os, uint64_t id) {
++    if (id == 0 || !os.is_window(id)) {
++      return ActivateResult::not_found;
++    }
++    // Same set as the window list: never child, hidden or host-owned windows.
++    if (!os.is_top_level(id) || !os.is_visible(id) || os.is_host_window(id)) {
++      return ActivateResult::not_found;
++    }
++    if (os.higher_integrity(id)) {
++      return ActivateResult::denied;
++    }
++    if (os.is_minimized(id)) {
++      os.restore(id);
++      for (int i = 0; i < 20 && os.is_minimized(id); ++i) {
++        os.sleep_ms(10);
++      }
++    }
++
++    bool accepted = os.set_foreground(id);
++    if (!accepted) {
++      // Foreground lock: only the process that got the last input may switch; an empty input makes it us.
++      os.nudge_foreground_lock();
++      accepted = os.set_foreground(id);
++    }
++    if (!accepted) {
++      BOOST_LOG(info) << "[Orbit] SetForegroundWindow refused for window " << id;
++      return ActivateResult::denied;
++    }
++
++    // TRUE does not guarantee the switch (e.g. a full-screen game keeps the foreground): confirm it.
++    for (int waited = 0;; waited += kForegroundPollMs) {
++      if (os.foreground_root() == id) {
++        return ActivateResult::ok;
++      }
++      if (waited >= kForegroundConfirmMs) {
++        break;
++      }
++      os.sleep_ms(kForegroundPollMs);
++    }
++    BOOST_LOG(info) << "[Orbit] window " << id << " did not become the foreground window";
++    return ActivateResult::denied;
++  }
++
++  bool run_power_action(Win32Ops &os, PowerAction action) {
++    switch (action) {
++      case PowerAction::shutdown:
++        return os.initiate_shutdown(false);
++      case PowerAction::restart:
++        return os.initiate_shutdown(true);
++      case PowerAction::sleep:
++        return os.suspend();
++      case PowerAction::logoff:
++        // As SYSTEM, log off from inside the user's session (shutdown /l -> ExitWindowsEx), so apps with
++        // unsaved work can still veto, like the non-SYSTEM path. WTSLogoffSession would force it.
++        return os.running_as_system() ? os.run_as_user(quoted_path(os.system_dir(), "shutdown.exe") + " /l") : os.exit_windows_logoff();
++      case PowerAction::lock:
++        // LockWorkStation only works from the user's interactive session.
++        return os.running_as_system() ? os.run_as_user(quoted_path(os.system_dir(), "rundll32.exe") + " user32.dll,LockWorkStation") : os.lock_workstation();
++    }
++    return false;
++  }
++}  // namespace orbit
+diff --git a/src/orbit/win_actions.h b/src/orbit/win_actions.h
+new file mode 100644
+index 00000000..b9679aa0
+--- /dev/null
++++ b/src/orbit/win_actions.h
+@@ -0,0 +1,76 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/win_actions.h
++ * @brief Window activation and power decisions over a thin Win32 seam (Win32Ops), so they can be tested with fakes.
++ */
++#pragma once
++
++#include "power_api.h"
++#include "windows_api.h"
++
++#include <cstdint>
++#include <string>
++
++namespace orbit {
++  /// Primitive Win32 calls used by activate_window / run_power_action. Window ids are HWND values.
++  class Win32Ops {
++  public:
++    virtual ~Win32Ops() = default;
++
++    // windows
++    virtual bool is_window(uint64_t id) = 0;
++    virtual bool is_top_level(uint64_t id) = 0;  ///< GetAncestor(h, GA_ROOT) == h
++    virtual bool is_visible(uint64_t id) = 0;
++    virtual bool is_host_window(uint64_t id) = 0;  ///< owned by the host process
++    virtual bool higher_integrity(uint64_t id) = 0;  ///< target process above the host's integrity level
++    virtual bool is_minimized(uint64_t id) = 0;
++    virtual void restore(uint64_t id) = 0;  ///< asynchronous restore
++    virtual bool set_foreground(uint64_t id) = 0;
++    virtual void nudge_foreground_lock() = 0;  ///< empty input event so SetForegroundWindow is allowed
++    virtual uint64_t foreground_root() = 0;  ///< GetAncestor(GetForegroundWindow(), GA_ROOT)
++    virtual void sleep_ms(int ms) = 0;
++
++    // power / processes
++    virtual bool running_as_system() = 0;
++    virtual bool run_as_user(const std::string &cmd) = 0;  ///< start a command in the logged-in user's context
++    virtual bool initiate_shutdown(bool reboot) = 0;  ///< not forced: apps can still veto
++    virtual bool suspend() = 0;
++    virtual bool exit_windows_logoff() = 0;  ///< ExitWindowsEx(EWX_LOGOFF) in our own session
++    virtual bool lock_workstation() = 0;
++    virtual std::string system_dir() = 0;  ///< e.g. C:\Windows\System32 (UTF-8, no trailing slash)
++    virtual std::string windows_dir() = 0;  ///< e.g. C:\Windows
++  };
++
++  /// How long activate waits for the foreground to really become the target after SetForegroundWindow.
++  inline constexpr int kForegroundConfirmMs = 300;
++  inline constexpr int kForegroundPollMs = 20;
++
++  /**
++   * @brief Activate a window: only visible top-level windows not owned by the host (else not_found);
++   * denied for higher-integrity targets, when SetForegroundWindow refuses, or when the foreground does not
++   * become the target within kForegroundConfirmMs.
++   */
++  ActivateResult activate_window(Win32Ops &os, uint64_t id);
++
++  /// Run a power action. Logoff and lock go through the user's context when the host runs as SYSTEM.
++  bool run_power_action(Win32Ops &os, PowerAction action);
++
++  /// `"<dir>\<exe>"` quoted, for run_as_user commands.
++  std::string quoted_path(const std::string &dir, const std::string &exe);
++}  // namespace orbit
+diff --git a/tests/unit/test_win_actions.cpp b/tests/unit/test_win_actions.cpp
+new file mode 100644
+index 00000000..ba9497d1
+--- /dev/null
++++ b/tests/unit/test_win_actions.cpp
+@@ -0,0 +1,191 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_win_actions.cpp
++ * @brief Test src/orbit/win_actions.* (activate and power decisions) with a fake Win32Ops. Never touches the PC.
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/win_actions.h>
++#include <vector>
++
++namespace {
++  constexpr uint64_t kTarget = 0x1000;
++
++  struct FakeOs: orbit::Win32Ops {
++    bool window = true, top_level = true, visible = true, host = false, elevated = false, minimized = false;
++    int set_fg_calls = 0;
++    std::vector<bool> set_fg_results {true};  ///< result per call (last one repeats)
++    int nudges = 0;
++    uint64_t fg = 0;  ///< current foreground root
++    int fg_after_ms = -1;  ///< foreground becomes kTarget after this many ms of sleeps (-1 = never)
++    int slept = 0;
++    bool system = false;
++    std::vector<std::string> user_cmds;
++    int shutdowns = 0, reboots = 0, suspends = 0, exit_logoffs = 0, locks = 0;
++
++    bool is_window(uint64_t) override { return window; }
++    bool is_top_level(uint64_t) override { return top_level; }
++    bool is_visible(uint64_t) override { return visible; }
++    bool is_host_window(uint64_t) override { return host; }
++    bool higher_integrity(uint64_t) override { return elevated; }
++    bool is_minimized(uint64_t) override { return minimized; }
++    void restore(uint64_t) override { minimized = false; }
++
++    bool set_foreground(uint64_t) override {
++      auto i = std::min<size_t>(set_fg_calls++, set_fg_results.size() - 1);
++      return set_fg_results[i];
++    }
++
++    void nudge_foreground_lock() override { ++nudges; }
++
++    uint64_t foreground_root() override {
++      return (fg_after_ms >= 0 && slept >= fg_after_ms) ? kTarget : fg;
++    }
++
++    void sleep_ms(int ms) override { slept += ms; }
++
++    bool running_as_system() override { return system; }
++
++    bool run_as_user(const std::string &cmd) override {
++      user_cmds.push_back(cmd);
++      return true;
++    }
++
++    bool initiate_shutdown(bool reboot) override {
++      (reboot ? reboots : shutdowns)++;
++      return true;
++    }
++
++    bool suspend() override { return ++suspends > 0; }
++    bool exit_windows_logoff() override { return ++exit_logoffs > 0; }
++    bool lock_workstation() override { return ++locks > 0; }
++    std::string system_dir() override { return "C:\\Windows\\System32"; }
++    std::string windows_dir() override { return "C:\\Windows"; }
++  };
++}  // namespace
++
++TEST(WinActions, ActivateOkWhenForegroundMatches) {
++  FakeOs os;
++  os.fg_after_ms = 0;
++  EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::ok);
++
++  FakeOs late;
++  late.fg_after_ms = 100;  // becomes foreground a bit later: still ok
++  EXPECT_EQ(orbit::activate_window(late, kTarget), orbit::ActivateResult::ok);
++}
++
++TEST(WinActions, ActivateDeniedWhenForegroundNeverMatches) {
++  FakeOs os;
++  os.fg = 0x2000;  // a full-screen game keeps the foreground even though SetForegroundWindow said TRUE
++  EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::denied);
++  EXPECT_GE(os.slept, orbit::kForegroundConfirmMs);
++  EXPECT_LE(os.slept, orbit::kForegroundConfirmMs + orbit::kForegroundPollMs);
++}
++
++TEST(WinActions, ActivateRetriesOnceAfterNudge) {
++  FakeOs os;
++  os.set_fg_results = {false, true};
++  os.fg_after_ms = 0;
++  EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::ok);
++  EXPECT_EQ(os.nudges, 1);
++
++  FakeOs refused;
++  refused.set_fg_results = {false};
++  EXPECT_EQ(orbit::activate_window(refused, kTarget), orbit::ActivateResult::denied);
++  EXPECT_EQ(refused.set_fg_calls, 2);
++}
++
++TEST(WinActions, ActivateRestoresMinimized) {
++  FakeOs os;
++  os.minimized = true;
++  os.fg_after_ms = 0;
++  EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::ok);
++  EXPECT_FALSE(os.minimized);
++}
++
++TEST(WinActions, ActivateRejectsChildHiddenAndHostWindows) {
++  {
++    FakeOs os;
++    os.window = false;
++    EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::not_found);
++    EXPECT_EQ(orbit::activate_window(os, 0), orbit::ActivateResult::not_found);
++  }
++  {
++    FakeOs os;
++    os.top_level = false;  // child window
++    EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::not_found);
++    EXPECT_EQ(os.set_fg_calls, 0);
++  }
++  {
++    FakeOs os;
++    os.visible = false;
++    EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::not_found);
++    EXPECT_EQ(os.set_fg_calls, 0);
++  }
++  {
++    FakeOs os;
++    os.host = true;
++    EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::not_found);
++    EXPECT_EQ(os.set_fg_calls, 0);
++  }
++  {
++    FakeOs os;
++    os.elevated = true;
++    EXPECT_EQ(orbit::activate_window(os, kTarget), orbit::ActivateResult::denied);
++    EXPECT_EQ(os.set_fg_calls, 0);
++  }
++}
++
++TEST(WinActions, LogoffAsSystemUsesUserContext) {
++  FakeOs os;
++  os.system = true;
++  EXPECT_TRUE(orbit::run_power_action(os, orbit::PowerAction::logoff));
++  ASSERT_EQ(os.user_cmds.size(), 1u);
++  EXPECT_EQ(os.user_cmds[0], "\"C:\\Windows\\System32\\shutdown.exe\" /l");
++  EXPECT_EQ(os.exit_logoffs, 0);
++
++  FakeOs user;
++  EXPECT_TRUE(orbit::run_power_action(user, orbit::PowerAction::logoff));
++  EXPECT_EQ(user.exit_logoffs, 1);
++  EXPECT_TRUE(user.user_cmds.empty());
++}
++
++TEST(WinActions, LockAsSystemUsesAbsoluteRundll32) {
++  FakeOs os;
++  os.system = true;
++  EXPECT_TRUE(orbit::run_power_action(os, orbit::PowerAction::lock));
++  ASSERT_EQ(os.user_cmds.size(), 1u);
++  EXPECT_EQ(os.user_cmds[0], "\"C:\\Windows\\System32\\rundll32.exe\" user32.dll,LockWorkStation");
++  EXPECT_EQ(os.locks, 0);
++
++  FakeOs user;
++  EXPECT_TRUE(orbit::run_power_action(user, orbit::PowerAction::lock));
++  EXPECT_EQ(user.locks, 1);
++}
++
++TEST(WinActions, ShutdownRestartSleepMapToPlatform) {
++  FakeOs os;
++  EXPECT_TRUE(orbit::run_power_action(os, orbit::PowerAction::shutdown));
++  EXPECT_TRUE(orbit::run_power_action(os, orbit::PowerAction::restart));
++  EXPECT_TRUE(orbit::run_power_action(os, orbit::PowerAction::sleep));
++  EXPECT_EQ(os.shutdowns, 1);
++  EXPECT_EQ(os.reboots, 1);
++  EXPECT_EQ(os.suspends, 1);
++  EXPECT_TRUE(os.user_cmds.empty());
++}
+-- 
+2.55.0.windows.5
+

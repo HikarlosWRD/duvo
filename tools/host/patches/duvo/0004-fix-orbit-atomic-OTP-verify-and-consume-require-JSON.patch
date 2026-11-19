@@ -1,0 +1,279 @@
+From d90ef73eb88190d87eba6ce1389385419de41495 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:41:22 -0300
+Subject: [PATCH 04/28] fix(orbit): atomic OTP verify-and-consume, require JSON
+ content type on pair-qr
+
+OtpSlot gets a mutex and verify_and_take(now, predicate): one locked
+expiry check + hash compare + consume with a single clock read (no
+empty-optional deref, no dangling pointer, no consuming a newer OTP).
+POST /api/orbit/pair-qr now calls validateContentType like getOTP.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/confighttp.cpp          |  2 +-
+ src/nvhttp.cpp              | 28 ++++++-------
+ src/orbit/otp_slot.cpp      | 27 +++++++------
+ src/orbit/otp_slot.h        | 18 ++++++++-
+ tests/unit/test_pair_qr.cpp | 80 +++++++++++++++++++++++++++++++------
+ 5 files changed, 112 insertions(+), 43 deletions(-)
+
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 429bf035..1aca2627 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -1267,7 +1267,7 @@ namespace confighttp {
+    * @api_examples{/api/orbit/pair-qr| POST| null}
+    */
+   void getOrbitPairQr(resp_https_t response, req_https_t request) {
+-    if (!authenticate(response, request)) {
++    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+       return;
+     }
+ 
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index ac88c7a2..714da9f3 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -752,24 +752,22 @@ namespace nvhttp {
+ 
+         auto it = args.find("otpauth");
+         if (it != std::end(args)) {
+-          // ORBIT: expiry/single-use delegated to orbit::OtpSlot
+-          const auto *otp = otp_slot.peek(std::chrono::steady_clock::now());
+-          if (!otp) {
++          // ORBIT: expiry/single-use delegated to orbit::OtpSlot (one locked check-and-consume, single clock read)
++          auto otp_res = otp_slot.verify_and_take(std::chrono::steady_clock::now(), [&](const orbit::OtpSlot::Otp &o) {
++            auto hash = util::hex(crypto::hash(o.pin + ptr->second.async_insert_pin.salt + o.passphrase), true);
++            return hash.to_string_view() == it->second;
++          });
++          if (otp_res.status == orbit::OtpSlot::Status::unavailable) {
+             tree.put("root.<xmlattr>.status_code", 503);
+             tree.put("root.<xmlattr>.status_message", "OTP auth not available.");
+-          } else {
+-            auto hash = util::hex(crypto::hash(otp->pin + ptr->second.async_insert_pin.salt + otp->passphrase), true);
+-
+-            if (hash.to_string_view() == it->second) {
+-              auto taken = otp_slot.take(std::chrono::steady_clock::now());
+-
+-              if (!taken->device_name.empty()) {
+-                ptr->second.client.name = std::move(taken->device_name);
+-              }
+-
+-              getservercert(ptr->second, tree, taken->pin);
+-              return;
++          } else if (otp_res.status == orbit::OtpSlot::Status::ok) {
++            auto &taken = *otp_res.otp;
++            if (!taken.device_name.empty()) {
++              ptr->second.client.name = std::move(taken.device_name);
+             }
++
++            getservercert(ptr->second, tree, taken.pin);
++            return;
+           }
+ 
+           // Always return positive, attackers will fail in the next steps.
+diff --git a/src/orbit/otp_slot.cpp b/src/orbit/otp_slot.cpp
+index 4822037c..eb07aeaa 100644
+--- a/src/orbit/otp_slot.cpp
++++ b/src/orbit/otp_slot.cpp
+@@ -23,27 +23,28 @@
+ 
+ namespace orbit {
+   void OtpSlot::issue(std::string pin, std::string passphrase, std::string device_name, clock::time_point now) {
++    std::lock_guard lock {m_};
+     otp_ = Otp {std::move(pin), std::move(passphrase), std::move(device_name), now};
+   }
+ 
+-  const OtpSlot::Otp *OtpSlot::peek(clock::time_point now) {
+-    if (!otp_) {
+-      return nullptr;
+-    }
+-    if (otp_->pin.empty() || now - otp_->created > ttl_) {
++  OtpSlot::Result OtpSlot::verify_and_take(clock::time_point now, const std::function<bool(const Otp &)> &matches) {
++    std::lock_guard lock {m_};
++    if (!otp_ || otp_->pin.empty() || now - otp_->created > ttl_) {
+       otp_.reset();
+-      return nullptr;
++      return {Status::unavailable, std::nullopt};
++    }
++    if (!matches(*otp_)) {
++      return {Status::mismatch, std::nullopt};
+     }
+-    return &*otp_;
++    Result r {Status::ok, std::move(otp_)};
++    otp_.reset();
++    return r;
+   }
+ 
+   std::optional<OtpSlot::Otp> OtpSlot::take(clock::time_point now) {
+-    if (!peek(now)) {
+-      return std::nullopt;
+-    }
+-    auto out = std::move(otp_);
+-    otp_.reset();
+-    return out;
++    return verify_and_take(now, [](const Otp &) {
++      return true;
++    }).otp;
+   }
+ 
+   void OtpSlot::clear() {
+diff --git a/src/orbit/otp_slot.h b/src/orbit/otp_slot.h
+index e859139a..6c47f4b2 100644
+--- a/src/orbit/otp_slot.h
++++ b/src/orbit/otp_slot.h
+@@ -22,6 +22,8 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <functional>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ 
+@@ -46,8 +48,19 @@ namespace orbit {
+     /// Replace any pending OTP.
+     void issue(std::string pin, std::string passphrase, std::string device_name, clock::time_point now);
+ 
+-    /// The pending OTP if still valid at `now`; an expired one is wiped and nullptr returned.
+-    const Otp *peek(clock::time_point now);
++    enum class Status {
++      unavailable,  ///< nothing pending or expired (slot wiped)
++      mismatch,  ///< predicate rejected; OTP stays pending
++      ok  ///< predicate accepted; OTP consumed
++    };
++
++    struct Result {
++      Status status;
++      std::optional<Otp> otp;  ///< set only when status == ok
++    };
++
++    /// Atomically: check expiry at `now`, evaluate `matches` on the pending OTP, consume on match.
++    Result verify_and_take(clock::time_point now, const std::function<bool(const Otp &)> &matches);
+ 
+     /// Return the pending OTP if valid and clear it (single use).
+     std::optional<Otp> take(clock::time_point now);
+@@ -55,6 +68,7 @@ namespace orbit {
+     void clear();
+ 
+   private:
++    std::mutex m_;
+     std::chrono::seconds ttl_;
+     std::optional<Otp> otp_;
+   };
+diff --git a/tests/unit/test_pair_qr.cpp b/tests/unit/test_pair_qr.cpp
+index 7652eaeb..4d8b8133 100644
+--- a/tests/unit/test_pair_qr.cpp
++++ b/tests/unit/test_pair_qr.cpp
+@@ -7,7 +7,9 @@
+ #include <src/orbit/otp_slot.h>
+ #include <src/orbit/pair_qr.h>
+ 
++#include <atomic>
+ #include <chrono>
++#include <thread>
+ 
+ using orbit::Adapter;
+ 
+@@ -58,31 +60,85 @@ TEST(PairQr, KeepsAddressThatOnlyLooksLinkLocal) {
+   EXPECT_EQ(orbit::usable_ipv4(in), (std::vector<std::string> {"169.2540.1.1"}));
+ }
+ 
++namespace {
++  const auto always = [](const orbit::OtpSlot::Otp &) {
++    return true;
++  };
++}
++
+ TEST(PairQr, OtpSingleUse) {
+   using namespace std::chrono_literals;
++  using S = orbit::OtpSlot::Status;
+   orbit::OtpSlot slot;
+   const auto t0 = orbit::OtpSlot::clock::time_point {} + 1000s;
+ 
+-  EXPECT_EQ(slot.peek(t0), nullptr);  // nothing issued yet
++  EXPECT_EQ(slot.verify_and_take(t0, always).status, S::unavailable);  // nothing issued
+   slot.issue("1234", "passphrase-abc", "", t0);
+-  ASSERT_NE(slot.peek(t0 + 10s), nullptr);
+-  EXPECT_EQ(slot.peek(t0 + 10s)->pin, "1234");
+ 
+   // consume once -> ok, again -> rejected
+-  auto first = slot.take(t0 + 10s);
+-  ASSERT_TRUE(first.has_value());
+-  EXPECT_EQ(first->passphrase, "passphrase-abc");
+-  EXPECT_FALSE(slot.take(t0 + 11s).has_value());
++  auto first = slot.verify_and_take(t0 + 10s, always);
++  ASSERT_EQ(first.status, S::ok);
++  ASSERT_TRUE(first.otp.has_value());
++  EXPECT_EQ(first.otp->passphrase, "passphrase-abc");
++  EXPECT_EQ(slot.verify_and_take(t0 + 11s, always).status, S::unavailable);
+ 
+-  // exactly at 180 s still valid, after 180 s rejected (and the slot is wiped)
++  // exactly 180 s still valid; just after, rejected without touching an empty optional
+   slot.issue("5678", "other-passphrase", "", t0);
+-  EXPECT_NE(slot.peek(t0 + 180s), nullptr);
+-  EXPECT_EQ(slot.peek(t0 + 180s + 1ms), nullptr);
+-  EXPECT_FALSE(slot.take(t0 + 180s + 1ms).has_value());
+-  EXPECT_FALSE(slot.take(t0 + 1s).has_value());
++  EXPECT_EQ(slot.verify_and_take(t0 + 180s, [](const orbit::OtpSlot::Otp &) { return false; }).status, S::mismatch);
++  auto late = slot.verify_and_take(t0 + 180s + 1ms, always);
++  EXPECT_EQ(late.status, S::unavailable);
++  EXPECT_FALSE(late.otp.has_value());
++  EXPECT_FALSE(slot.take(t0 + 1s).has_value());  // wiped
+ 
+   // re-issuing replaces the previous OTP
+   slot.issue("1111", "aaaaaaaaaaaaaaaa", "", t0);
+   slot.issue("2222", "bbbbbbbbbbbbbbbb", "", t0);
+   EXPECT_EQ(slot.take(t0)->pin, "2222");
+ }
++
++TEST(PairQr, OtpMismatchKeepsOtpMatchConsumes) {
++  using S = orbit::OtpSlot::Status;
++  orbit::OtpSlot slot;
++  const auto t0 = orbit::OtpSlot::clock::time_point {} + std::chrono::seconds {5};
++  slot.issue("4321", "pp-pp-pp-pp-pp-pp", "dev", t0);
++  auto is = [](const char *pin) {
++    return [pin](const orbit::OtpSlot::Otp &o) {
++      return o.pin == pin;
++    };
++  };
++  EXPECT_EQ(slot.verify_and_take(t0, is("0000")).status, S::mismatch);
++  EXPECT_EQ(slot.verify_and_take(t0, is("0000")).status, S::mismatch);  // still pending
++  auto ok = slot.verify_and_take(t0, is("4321"));
++  ASSERT_EQ(ok.status, S::ok);
++  EXPECT_EQ(ok.otp->device_name, "dev");
++  EXPECT_EQ(slot.verify_and_take(t0, is("4321")).status, S::unavailable);
++}
++
++TEST(PairQr, OtpConcurrentIssueAndVerify) {
++  orbit::OtpSlot slot;
++  std::atomic<bool> stop {false};
++  std::atomic<int> consumed {0};
++  std::thread issuer([&] {
++    while (!stop) {
++      slot.issue("1234", std::string(24, 'x'), "dev", orbit::OtpSlot::clock::now());
++    }
++  });
++  std::thread verifier([&] {
++    for (int i = 0; i < 200000; ++i) {
++      auto r = slot.verify_and_take(orbit::OtpSlot::clock::now(), [](const orbit::OtpSlot::Otp &o) {
++        return o.pin == "1234" && o.passphrase.size() == 24;
++      });
++      if (r.status == orbit::OtpSlot::Status::ok) {
++        EXPECT_TRUE(r.otp.has_value());
++        if (r.otp) {
++          EXPECT_EQ(r.otp->passphrase.size(), 24u);
++        }
++        ++consumed;
++      }
++    }
++    stop = true;
++  });
++  verifier.join();
++  issuer.join();
++  EXPECT_GT(consumed.load(), 0);
++}
+-- 
+2.55.0.windows.5
+

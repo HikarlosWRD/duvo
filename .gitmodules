@@ -1,0 +1,3 @@
+[submodule "android/app/src/main/cpp/moonlight-common-c"]
+	path = android/app/src/main/cpp/moonlight-common-c
+	url = https://github.com/moonlight-stream/moonlight-common-c.git

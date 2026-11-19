@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Duvo - remote control and streaming for a Windows PC.
+  Copyright (C) 2026 Duvo contributors. Licensed under the GNU GPL v3 or later.
+
+  GameStream serverinfo and the pairing handshake run over plain HTTP to LAN hosts addressed by IP
+  (authenticity comes from the pairing crypto and the QR-pinned host cert), so cleartext must be
+  allowed. Everything else is HTTPS that trusts only the pinned host cert (HostClient), never the
+  system CAs or user CAs for those connections.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

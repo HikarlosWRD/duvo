@@ -1,0 +1,799 @@
+From dda95aa27f4fec4a8a40fccbff3626a3f29195e8 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:50:47 -0300
+Subject: [PATCH 20/28] feat(orbit): reverse mode service (adb + scrcpy) with
+ web UI card
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake        |   2 +
+ src/confighttp.cpp                            |  98 ++++++
+ src/orbit/reverse_mode.cpp                    | 307 ++++++++++++++++++
+ src/orbit/reverse_mode.h                      |  77 +++++
+ src_assets/common/assets/web/pin.html         |  69 ++++
+ .../assets/web/public/assets/locale/en.json   |  21 +-
+ .../web/public/assets/locale/pt_BR.json       |  21 +-
+ tests/unit/test_orbit_reverse.cpp             |  72 ++++
+ 8 files changed, 665 insertions(+), 2 deletions(-)
+ create mode 100644 src/orbit/reverse_mode.cpp
+ create mode 100644 src/orbit/reverse_mode.h
+ create mode 100644 tests/unit/test_orbit_reverse.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 7c7c7887..16f4c82b 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -129,6 +129,8 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/win_actions.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/clipboard_image.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/clipboard_image.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/reverse_mode.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/reverse_mode.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 1aca2627..65db4d9f 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -36,6 +36,7 @@
+ #include "network.h"
+ #include "nvhttp.h"
+ #include "orbit/pair_service.h"  // ORBIT:
++#include "orbit/reverse_mode.h"  // ORBIT:
+ #include "platform/common.h"
+ #include "process.h"
+ #include "utility.h"
+@@ -1285,6 +1286,98 @@ namespace confighttp {
+     }
+   }
+ 
++  namespace {
++    /// ORBIT: reverse mode service (adb + scrcpy), created on first use.
++    orbit::reverse::Service &reverse_service() {
++      static orbit::reverse::Service service {""};
++      return service;
++    }
++
++    nlohmann::json reverse_status() {
++      auto &svc = reverse_service();
++      nlohmann::json j;
++      j["tools"] = {{"adb", svc.has_tool("adb")}, {"scrcpy", svc.has_tool("scrcpy")}};
++      nlohmann::json devs = nlohmann::json::array();
++      for (auto &d : svc.devices()) {
++        devs.push_back({{"serial", d.serial}, {"state", d.state}, {"model", d.model}});
++      }
++      j["devices"] = devs;
++      j["running"] = svc.running();
++      return j;
++    }
++
++    /// Common prologue of the reverse endpoints: JSON body parsed into [body], false when the request was answered.
++    bool reverse_prologue(resp_https_t &response, req_https_t &request, nlohmann::json &body) {
++      if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
++        return false;
++      }
++      print_req(request);
++      body = nlohmann::json::parse(request->content.string(), nullptr, false);
++      if (body.is_discarded() || !body.is_object()) {
++        bad_request(response, request, "Invalid JSON");
++        return false;
++      }
++      return true;
++    }
++  }  // namespace
++
++  /// ORBIT: list adb devices and tool availability. Body: {}
++  void orbitReverseDevices(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    send_response(response, reverse_status());
++  }
++
++  /// ORBIT: pair with the phone's wireless-debugging pairing code. Body: {"hostport": "ip:port", "code": "123456"}
++  void orbitReversePair(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    auto r = reverse_service().pair(body.value("hostport", ""), body.value("code", ""));
++    send_response(response, nlohmann::json {{"ok", r.ok}, {"output", r.output}});
++  }
++
++  /// ORBIT: connect to a paired phone. Body: {"hostport": "ip:port"}
++  void orbitReverseConnect(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    auto r = reverse_service().connect(body.value("hostport", ""));
++    send_response(response, nlohmann::json {{"ok", r.ok}, {"output", r.output}});
++  }
++
++  /// ORBIT: open the phone window. Body: {"serial", "bitrate_mbps", "max_size", "max_fps", "audio", "turn_screen_off", "always_on_top"}
++  void orbitReverseStart(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    orbit::reverse::MirrorOptions o;
++    o.bitrate_mbps = body.value("bitrate_mbps", o.bitrate_mbps);
++    o.max_size = body.value("max_size", o.max_size);
++    o.max_fps = body.value("max_fps", o.max_fps);
++    o.audio = body.value("audio", o.audio);
++    o.turn_screen_off = body.value("turn_screen_off", o.turn_screen_off);
++    o.always_on_top = body.value("always_on_top", o.always_on_top);
++    std::string error;
++    bool ok = reverse_service().start(body.value("serial", ""), o, error);
++    send_response(response, nlohmann::json {{"ok", ok}, {"error", error}});
++  }
++
++  /// ORBIT: close the phone window. Body: {"serial": "..."}
++  void orbitReverseStop(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    reverse_service().stop(body.value("serial", ""));
++    send_response(response, nlohmann::json {{"ok", true}});
++  }
++
+   /**
+    * @brief Send a PIN code to the host.
+    * @param response The HTTP response object.
+@@ -1558,6 +1651,11 @@ namespace confighttp {
+     server.resource["^/api/pin$"]["POST"] = savePin;
+     server.resource["^/api/otp$"]["POST"] = getOTP;
+     server.resource["^/api/orbit/pair-qr$"]["POST"] = getOrbitPairQr;  // ORBIT:
++    server.resource["^/api/orbit/reverse/devices$"]["POST"] = orbitReverseDevices;  // ORBIT:
++    server.resource["^/api/orbit/reverse/pair$"]["POST"] = orbitReversePair;  // ORBIT:
++    server.resource["^/api/orbit/reverse/connect$"]["POST"] = orbitReverseConnect;  // ORBIT:
++    server.resource["^/api/orbit/reverse/start$"]["POST"] = orbitReverseStart;  // ORBIT:
++    server.resource["^/api/orbit/reverse/stop$"]["POST"] = orbitReverseStop;  // ORBIT:
+     server.resource["^/api/apps$"]["GET"] = getApps;
+     server.resource["^/api/apps$"]["POST"] = saveApp;
+     server.resource["^/api/apps/reorder$"]["POST"] = reorderApps;
+diff --git a/src/orbit/reverse_mode.cpp b/src/orbit/reverse_mode.cpp
+new file mode 100644
+index 00000000..3f221d4a
+--- /dev/null
++++ b/src/orbit/reverse_mode.cpp
+@@ -0,0 +1,307 @@
++/**
++ * @file src/orbit/reverse_mode.cpp
++ * @brief ORBIT: reverse mode (scrcpy over wireless ADB).
++ */
++#include "reverse_mode.h"
++
++#include "src/logging.h"
++#include "src/platform/common.h"
++
++#include <algorithm>
++#include <boost/filesystem.hpp>
++#include <boost/process/v1/args.hpp>
++#include <boost/process/v1/child.hpp>
++#include <boost/process/v1/io.hpp>
++#include <boost/process/v1/pipe.hpp>
++#include <boost/process/v1/search_path.hpp>
++#include <boost/process/v1/windows.hpp>
++#include <future>
++#include <mutex>
++#include <regex>
++#include <sstream>
++#include <thread>
++
++using namespace std::literals;
++
++namespace orbit::reverse {
++  namespace {
++    namespace bp = boost::process::v1;
++
++    std::string trim(std::string s) {
++      auto issp = [](unsigned char c) { return std::isspace(c) != 0; };
++      s.erase(s.begin(), std::find_if_not(s.begin(), s.end(), issp));
++      s.erase(std::find_if_not(s.rbegin(), s.rend(), issp).base(), s.end());
++      return s;
++    }
++  }  // namespace
++
++  std::vector<AdbDevice> parse_devices(const std::string &output) {
++    std::vector<AdbDevice> out;
++    std::istringstream in(output);
++    std::string line;
++    while (std::getline(in, line)) {
++      line = trim(line);
++      if (line.empty() || line.rfind("List of devices", 0) == 0 || line[0] == '*') {
++        continue;
++      }
++      std::istringstream ls(line);
++      AdbDevice d;
++      if (!(ls >> d.serial >> d.state)) {
++        continue;
++      }
++      std::string tok;
++      while (ls >> tok) {
++        if (tok.rfind("model:", 0) == 0) {
++          d.model = tok.substr(6);
++          std::replace(d.model.begin(), d.model.end(), '_', ' ');
++        }
++      }
++      out.push_back(std::move(d));
++    }
++    return out;
++  }
++
++  bool valid_hostport(const std::string &s) {
++    static const std::regex re(R"(^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}):(\d{1,5})$)");
++    std::smatch m;
++    if (!std::regex_match(s, m, re)) {
++      return false;
++    }
++    for (int i = 1; i <= 4; ++i) {
++      if (std::stoi(m[i]) > 255) {
++        return false;
++      }
++    }
++    int port = std::stoi(m[5]);
++    return port >= 1 && port <= 65535;
++  }
++
++  bool valid_pair_code(const std::string &s) {
++    return s.size() == 6 && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
++  }
++
++  bool valid_serial(const std::string &s) {
++    if (s.empty() || s.size() > 128) {
++      return false;
++    }
++    return std::all_of(s.begin(), s.end(), [](unsigned char c) {
++      return std::isalnum(c) || c == '.' || c == '_' || c == ':' || c == '-';
++    });
++  }
++
++  MirrorOptions clamp(MirrorOptions o) {
++    o.bitrate_mbps = std::clamp(o.bitrate_mbps, 1, 100);
++    o.max_size = o.max_size == 0 ? 0 : std::clamp(o.max_size, 320, 4096);
++    o.max_fps = std::clamp(o.max_fps, 10, 120);
++    return o;
++  }
++
++  std::vector<std::string> scrcpy_args(const std::string &serial, const MirrorOptions &raw) {
++    auto o = clamp(raw);
++    std::vector<std::string> a {"-s", serial, "--window-title=Orbit - celular"s, "--video-bit-rate="s + std::to_string(o.bitrate_mbps) + "M"s, "--max-fps="s + std::to_string(o.max_fps)};
++    if (o.max_size > 0) {
++      a.push_back("--max-size="s + std::to_string(o.max_size));
++    }
++    if (!o.audio) {
++      a.push_back("--no-audio");
++    }
++    if (o.turn_screen_off) {
++      a.push_back("--turn-screen-off");
++    }
++    if (o.stay_awake) {
++      a.push_back("--stay-awake");
++    }
++    if (o.always_on_top) {
++      a.push_back("--always-on-top");
++    }
++    return a;
++  }
++
++  std::string quote_command(const std::string &exe, const std::vector<std::string> &args) {
++    auto quote = [](const std::string &s) {
++      if (!s.empty() && s.find_first_of(" \t\"") == std::string::npos) {
++        return s;
++      }
++      std::string r = "\"";
++      size_t backslashes = 0;
++      for (char c : s) {
++        if (c == '\\') {
++          ++backslashes;
++          continue;
++        }
++        if (c == '"') {
++          r.append(backslashes * 2 + 1, '\\');
++          r += '"';
++        } else {
++          r.append(backslashes, '\\');
++          r += c;
++        }
++        backslashes = 0;
++      }
++      r.append(backslashes * 2, '\\');
++      r += '"';
++      return r;
++    };
++    std::string out = quote(exe);
++    for (auto &a : args) {
++      out += ' ' + quote(a);
++    }
++    return out;
++  }
++
++  struct Service::Impl {
++    std::string tools_dir;
++    std::mutex mutex;
++    std::map<std::string, bp::child> mirrors;
++
++    std::string find(const std::string &name) const {
++      boost::system::error_code ec;
++      const std::string exe = name + ".exe";
++      if (!tools_dir.empty()) {
++        auto p = boost::filesystem::path(tools_dir) / exe;
++        if (boost::filesystem::exists(p, ec)) {
++          return p.string();
++        }
++      }
++      // The installer puts adb/scrcpy in "tools" next to sunshine.exe, which is also the working directory.
++      auto beside = boost::filesystem::current_path(ec) / "tools" / exe;
++      if (!ec && boost::filesystem::exists(beside, ec)) {
++        return beside.string();
++      }
++      auto found = bp::search_path(name);
++      return found.string();
++    }
++
++    void prune() {
++      for (auto it = mirrors.begin(); it != mirrors.end();) {
++        std::error_code ec;
++        if (!it->second.running(ec)) {
++          it = mirrors.erase(it);
++        } else {
++          ++it;
++        }
++      }
++    }
++
++    AdbResult run_adb(const std::vector<std::string> &args, std::chrono::seconds limit) {
++      auto adb = find("adb");
++      if (adb.empty()) {
++        return {false, "adb not found"};
++      }
++      try {
++        bp::ipstream out;
++        bp::child c(adb, bp::args(args), (bp::std_out & bp::std_err) > out, bp::windows::hide);
++        auto reader = std::async(std::launch::async, [&out] {
++          std::string all, line;
++          while (std::getline(out, line)) {
++            all += line + '\n';
++          }
++          return all;
++        });
++        // wait_for is flagged unreliable in Boost.Process v1: poll instead.
++        auto deadline = std::chrono::steady_clock::now() + limit;
++        std::error_code ec;
++        while (c.running(ec) && std::chrono::steady_clock::now() < deadline) {
++          std::this_thread::sleep_for(50ms);
++        }
++        if (c.running(ec)) {
++          c.terminate(ec);
++          out.pipe().close();
++          return {false, "timeout"};
++        }
++        c.wait(ec);
++        auto text = reader.get();
++        return {c.exit_code() == 0, text};
++      } catch (std::exception &e) {
++        return {false, e.what()};
++      }
++    }
++  };
++
++  Service::Service(std::string tools_dir):
++      impl_(new Impl {std::move(tools_dir), {}, {}}) {}
++
++  Service::~Service() {
++    {
++      std::lock_guard lock(impl_->mutex);
++      for (auto &[serial, child] : impl_->mirrors) {
++        std::error_code ec;
++        child.terminate(ec);
++      }
++    }
++    delete impl_;
++  }
++
++  bool Service::has_tool(const std::string &name) const {
++    return !impl_->find(name).empty();
++  }
++
++  std::vector<AdbDevice> Service::devices() {
++    auto r = impl_->run_adb({"devices", "-l"}, 10s);
++    return r.ok ? parse_devices(r.output) : std::vector<AdbDevice> {};
++  }
++
++  AdbResult Service::pair(const std::string &hostport, const std::string &code) {
++    if (!valid_hostport(hostport) || !valid_pair_code(code)) {
++      return {false, "invalid"};
++    }
++    return impl_->run_adb({"pair", hostport, code}, 20s);
++  }
++
++  AdbResult Service::connect(const std::string &hostport) {
++    if (!valid_hostport(hostport)) {
++      return {false, "invalid"};
++    }
++    return impl_->run_adb({"connect", hostport}, 15s);
++  }
++
++  bool Service::start(const std::string &serial, const MirrorOptions &opts, std::string &error) {
++    if (!valid_serial(serial)) {
++      error = "invalid_serial";
++      return false;
++    }
++    auto scrcpy = impl_->find("scrcpy");
++    if (scrcpy.empty()) {
++      error = "scrcpy_missing";
++      return false;
++    }
++    std::lock_guard lock(impl_->mutex);
++    impl_->prune();
++    if (impl_->mirrors.count(serial)) {
++      error = "already_running";
++      return false;
++    }
++    // Interactive: the window must open in the logged-in user's session, also when the host runs as a service.
++    std::error_code ec;
++    auto cmd = quote_command(scrcpy, scrcpy_args(serial, opts));
++    boost::filesystem::path wd = boost::filesystem::path(scrcpy).parent_path();
++    auto child = platf::run_command(false, true, cmd, wd, bp::environment(boost::this_process::environment()), nullptr, ec, nullptr);
++    if (ec) {
++      error = "spawn_failed: " + ec.message();
++      return false;
++    }
++    impl_->mirrors.emplace(serial, std::move(child));
++    return true;
++  }
++
++  void Service::stop(const std::string &serial) {
++    std::lock_guard lock(impl_->mutex);
++    auto it = impl_->mirrors.find(serial);
++    if (it == impl_->mirrors.end()) {
++      return;
++    }
++    std::error_code ec;
++    it->second.terminate(ec);
++    impl_->mirrors.erase(it);
++  }
++
++  std::vector<std::string> Service::running() {
++    std::lock_guard lock(impl_->mutex);
++    impl_->prune();
++    std::vector<std::string> out;
++    for (auto &[serial, c] : impl_->mirrors) {
++      out.push_back(serial);
++    }
++    return out;
++  }
++}  // namespace orbit::reverse
+diff --git a/src/orbit/reverse_mode.h b/src/orbit/reverse_mode.h
+new file mode 100644
+index 00000000..0c17a260
+--- /dev/null
++++ b/src/orbit/reverse_mode.h
+@@ -0,0 +1,77 @@
++/**
++ * @file src/orbit/reverse_mode.h
++ * @brief ORBIT: reverse mode, the phone's screen in a window on the PC (scrcpy over wireless ADB).
++ *
++ * Pure helpers (parsing, validation, command lines) are separate from process running so they can be unit tested.
++ */
++#pragma once
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace orbit::reverse {
++  struct AdbDevice {
++    std::string serial;  ///< e.g. "192.168.1.5:41234" or "adb-XXXX._adb-tls-connect._tcp"
++    std::string state;  ///< "device", "unauthorized", "offline"
++    std::string model;  ///< from `model:` in `adb devices -l`, may be empty
++  };
++
++  /// Parses the output of `adb devices -l`.
++  std::vector<AdbDevice> parse_devices(const std::string &output);
++
++  /// "192.168.1.5:41234" (IPv4 and a port 1-65535). Rejects anything that is not exactly that.
++  bool valid_hostport(const std::string &s);
++
++  /// 6-digit wireless-debugging pairing code.
++  bool valid_pair_code(const std::string &s);
++
++  /// Characters adb itself puts in serials; anything else is refused (the value ends up in a command line).
++  bool valid_serial(const std::string &s);
++
++  struct MirrorOptions {
++    int bitrate_mbps = 8;  ///< 1..100
++    int max_size = 0;  ///< longest side in px, 0 = device size, else 320..4096
++    int max_fps = 60;  ///< 10..120
++    bool audio = true;  ///< phone audio on the PC (Android 11+)
++    bool turn_screen_off = false;  ///< phone screen off while mirrored
++    bool stay_awake = true;
++    bool always_on_top = false;
++  };
++
++  /// Clamps every field into its documented range.
++  MirrorOptions clamp(MirrorOptions o);
++
++  /// Argument vector for scrcpy (no shell involved). [serial] must pass valid_serial.
++  std::vector<std::string> scrcpy_args(const std::string &serial, const MirrorOptions &o);
++
++  /// A command line for one process with every argument quoted for CreateProcess (Windows rules).
++  std::string quote_command(const std::string &exe, const std::vector<std::string> &args);
++
++  struct AdbResult {
++    bool ok = false;
++    std::string output;
++  };
++
++  /// Runs mirrored phones. Methods are thread-safe.
++  class Service {
++  public:
++    /// Where adb/scrcpy are searched: `tools_dir` (may be empty), then "tools" under the working directory, then PATH.
++    explicit Service(std::string tools_dir);
++    ~Service();
++
++    bool has_tool(const std::string &name) const;
++    std::vector<AdbDevice> devices();
++    AdbResult pair(const std::string &hostport, const std::string &code);
++    AdbResult connect(const std::string &hostport);
++    /// Starts scrcpy for [serial]; false (with [error]) when a tool is missing or already running for it.
++    bool start(const std::string &serial, const MirrorOptions &opts, std::string &error);
++    void stop(const std::string &serial);
++    std::vector<std::string> running();
++
++  private:
++    struct Impl;
++    Impl *impl_;
++  };
++}  // namespace orbit::reverse
+diff --git a/src_assets/common/assets/web/pin.html b/src_assets/common/assets/web/pin.html
+index f9fe7340..d3fc5a65 100644
+--- a/src_assets/common/assets/web/pin.html
++++ b/src_assets/common/assets/web/pin.html
+@@ -31,6 +31,42 @@
+       <button class="btn btn-primary" type="button" @click="generateOrbitQR">{{ orbitUri ? $t('pin.orbit_qr_regenerate') : $t('pin.orbit_qr_generate') }}</button>
+       <p class="text-secondary mt-3 mb-0">{{ $t('pin.orbit_qr_hint') }}</p>
+     </div>
++    <!-- ORBIT: reverse mode (phone screen on the PC via adb + scrcpy) -->
++    <div class="card p-4 mb-4" id="orbit-reverse-card" style="max-width: 640px; width: 100%">
++      <h2 class="mb-2">{{ $t('pin.orbit_rev_title') }}</h2>
++      <p class="text-secondary">{{ $t('pin.orbit_rev_hint') }}</p>
++      <div v-if="rev.tools && (!rev.tools.adb || !rev.tools.scrcpy)" class="alert alert-warning">{{ $t('pin.orbit_rev_missing') }}</div>
++      <div v-if="rev.msg" class="alert alert-info" style="white-space: pre-wrap">{{ rev.msg }}</div>
++      <div class="d-flex align-items-center mb-2">
++        <strong class="flex-grow-1">{{ $t('pin.orbit_rev_title') }}</strong>
++        <button class="btn btn-sm btn-outline-secondary" type="button" @click="revRefresh">{{ $t('pin.orbit_rev_refresh') }}</button>
++      </div>
++      <p v-if="!rev.devices.length" class="text-secondary">{{ $t('pin.orbit_rev_none') }}</p>
++      <ul class="list-group mb-3" v-if="rev.devices.length">
++        <li v-for="d in rev.devices" class="list-group-item d-flex align-items-center">
++          <span class="flex-grow-1">{{ d.model || d.serial }} <small class="text-secondary">{{ d.serial }}</small>
++            <small v-if="d.state === 'unauthorized'" class="text-danger d-block">{{ $t('pin.orbit_rev_unauthorized') }}</small>
++          </span>
++          <button v-if="d.state === 'device' && !rev.running.includes(d.serial)" class="btn btn-sm btn-primary" type="button" @click="revStart(d.serial)">{{ $t('pin.orbit_rev_open') }}</button>
++          <button v-if="rev.running.includes(d.serial)" class="btn btn-sm btn-outline-danger" type="button" @click="revStop(d.serial)">{{ $t('pin.orbit_rev_close') }}</button>
++        </li>
++      </ul>
++      <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-audio" v-model="rev.audio"><label class="form-check-label" for="rev-audio">{{ $t('pin.orbit_rev_audio') }}</label></div>
++      <div class="form-check mb-3"><input class="form-check-input" type="checkbox" id="rev-off" v-model="rev.screenOff"><label class="form-check-label" for="rev-off">{{ $t('pin.orbit_rev_screen_off') }}</label></div>
++      <h3 class="h6">{{ $t('pin.orbit_rev_pair_title') }}</h3>
++      <p class="text-secondary small">{{ $t('pin.orbit_rev_pair_hint') }}</p>
++      <div class="input-group mb-3">
++        <input class="form-control" v-model="rev.pairAddr" :placeholder="$t('pin.orbit_rev_addr')">
++        <input class="form-control" v-model="rev.pairCode" :placeholder="$t('pin.orbit_rev_code')" maxlength="6">
++        <button class="btn btn-outline-primary" type="button" @click="revPair">{{ $t('pin.orbit_rev_pair') }}</button>
++      </div>
++      <h3 class="h6">{{ $t('pin.orbit_rev_connect_title') }}</h3>
++      <p class="text-secondary small">{{ $t('pin.orbit_rev_connect_hint') }}</p>
++      <div class="input-group">
++        <input class="form-control" v-model="rev.connectAddr" :placeholder="$t('pin.orbit_rev_addr')">
++        <button class="btn btn-outline-primary" type="button" @click="revConnect">{{ $t('pin.orbit_rev_connect') }}</button>
++      </div>
++    </div>
+     <ul class="nav nav-pills pin-tab-bar justify-content-center">
+       <li class="nav-item">
+         <a class="nav-link" :class="{active: currentTab !== '#PIN'}" href="#OTP" @click.prevent="switchTab('OTP')">{{ $t('pin.otp_pairing') }}</a>
+@@ -403,6 +439,7 @@
+       editingHost: false,
+       currentTab: location.hash || '#OTP',
+       orbitUri: '',
++      rev: { tools: null, devices: [], running: [], msg: '', audio: true, screenOff: false, pairAddr: '', pairCode: '', connectAddr: '' },
+       orbitRemaining: 0,
+       orbitError: '',
+       otp: '',
+@@ -448,6 +485,7 @@
+     },
+     created() {
+       this.refreshClients();
++      this.revRefresh();
+     },
+     methods: {
+       switchTab(currentTab) {
+@@ -499,6 +537,37 @@
+             }
+           });
+       },
++      revPost(path, body) {
++        return fetch("./api/orbit/reverse/" + path, {
++          credentials: 'include',
++          headers: { 'Content-Type': 'application/json' },
++          method: 'POST',
++          body: JSON.stringify(body || {})
++        }).then(r => r.json());
++      },
++      revRefresh() {
++        return this.revPost('devices').then(r => {
++          this.rev.tools = r.tools; this.rev.devices = r.devices || []; this.rev.running = r.running || [];
++        }).catch(() => {});
++      },
++      revPair() {
++        this.rev.msg = '';
++        this.revPost('pair', { hostport: this.rev.pairAddr.trim(), code: this.rev.pairCode.trim() })
++          .then(r => { this.rev.msg = (r.ok ? '' : this.$t('pin.orbit_rev_failed') + ': ') + (r.output || ''); this.revRefresh(); });
++      },
++      revConnect() {
++        this.rev.msg = '';
++        this.revPost('connect', { hostport: this.rev.connectAddr.trim() })
++          .then(r => { this.rev.msg = (r.ok ? '' : this.$t('pin.orbit_rev_failed') + ': ') + (r.output || ''); this.revRefresh(); });
++      },
++      revStart(serial) {
++        this.rev.msg = '';
++        this.revPost('start', { serial, audio: this.rev.audio, turn_screen_off: this.rev.screenOff })
++          .then(r => { if (!r.ok) this.rev.msg = this.$t('pin.orbit_rev_failed') + ': ' + (r.error || ''); this.revRefresh(); });
++      },
++      revStop(serial) {
++        this.revPost('stop', { serial }).then(() => this.revRefresh());
++      },
+       generateOrbitQR() {
+         this.orbitError = '';
+         fetch("./api/orbit/pair-qr", {
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index ee4157e1..bd7097b0 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -571,7 +571,26 @@
+     "orbit_preset_total_desc": "Everything, including file transfer and PC commands",
+     "orbit_preset_control_desc": "See, open apps, all input, clipboard, windows and power",
+     "orbit_preset_watch_desc": "Only list and view",
+-    "orbit_preset_disabled_desc": "Blocked: the device stays paired but can do nothing"
++    "orbit_preset_disabled_desc": "Blocked: the device stays paired but can do nothing",
++    "orbit_rev_title": "Phone on this PC (reverse mode)",
++    "orbit_rev_hint": "Shows the phone screen in a window here and lets you control it with the mouse and keyboard. On the phone: Developer options > Wireless debugging.",
++    "orbit_rev_missing": "adb and scrcpy were not found. Put them in the \"tools\" folder next to Orbit or add them to PATH.",
++    "orbit_rev_refresh": "Refresh",
++    "orbit_rev_none": "No phone connected.",
++    "orbit_rev_pair_title": "Pair a new phone",
++    "orbit_rev_pair_hint": "On the phone, open Wireless debugging > Pair device with pairing code, then type the address and code shown.",
++    "orbit_rev_addr": "Address (ip:port)",
++    "orbit_rev_code": "Pairing code",
++    "orbit_rev_pair": "Pair",
++    "orbit_rev_connect_title": "Connect",
++    "orbit_rev_connect_hint": "Address shown on the Wireless debugging screen (a different port than pairing).",
++    "orbit_rev_connect": "Connect",
++    "orbit_rev_open": "Open",
++    "orbit_rev_close": "Close",
++    "orbit_rev_unauthorized": "Accept the debugging prompt on the phone.",
++    "orbit_rev_audio": "Phone audio on the PC",
++    "orbit_rev_screen_off": "Turn the phone screen off",
++    "orbit_rev_failed": "Failed"
+   },
+   "resource_card": {
+     "github_discussions": "GitHub Discussions",
+diff --git a/src_assets/common/assets/web/public/assets/locale/pt_BR.json b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+index 258be1a5..7f7bf479 100644
+--- a/src_assets/common/assets/web/public/assets/locale/pt_BR.json
++++ b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+@@ -525,7 +525,26 @@
+     "orbit_preset_total_desc": "Tudo, inclusive transferir arquivos e comandos no PC",
+     "orbit_preset_control_desc": "Ver, abrir apps, todos os controles, área de transferência, janelas e energia",
+     "orbit_preset_watch_desc": "Só listar e assistir",
+-    "orbit_preset_disabled_desc": "Bloqueado: continua pareado, mas não pode fazer nada"
++    "orbit_preset_disabled_desc": "Bloqueado: continua pareado, mas não pode fazer nada",
++    "orbit_rev_title": "Celular no PC (modo inverso)",
++    "orbit_rev_hint": "Mostra a tela do celular numa janela aqui e deixa você controlar com mouse e teclado. No celular: Opções do desenvolvedor > Depuração sem fio.",
++    "orbit_rev_missing": "Não encontrei o adb e o scrcpy. Coloque-os na pasta \"tools\" ao lado do Orbit ou no PATH.",
++    "orbit_rev_refresh": "Atualizar",
++    "orbit_rev_none": "Nenhum celular conectado.",
++    "orbit_rev_pair_title": "Parear um celular novo",
++    "orbit_rev_pair_hint": "No celular, abra Depuração sem fio > Parear dispositivo com código e digite o endereço e o código mostrados.",
++    "orbit_rev_addr": "Endereço (ip:porta)",
++    "orbit_rev_code": "Código de pareamento",
++    "orbit_rev_pair": "Parear",
++    "orbit_rev_connect_title": "Conectar",
++    "orbit_rev_connect_hint": "Endereço mostrado na tela de Depuração sem fio (a porta é outra, diferente do pareamento).",
++    "orbit_rev_connect": "Conectar",
++    "orbit_rev_open": "Abrir",
++    "orbit_rev_close": "Fechar",
++    "orbit_rev_unauthorized": "Aceite o aviso de depuração no celular.",
++    "orbit_rev_audio": "Som do celular no PC",
++    "orbit_rev_screen_off": "Apagar a tela do celular",
++    "orbit_rev_failed": "Falhou"
+   },
+   "resource_card": {
+     "github_discussions": "Discussões no GitHub",
+diff --git a/tests/unit/test_orbit_reverse.cpp b/tests/unit/test_orbit_reverse.cpp
+new file mode 100644
+index 00000000..489c0bca
+--- /dev/null
++++ b/tests/unit/test_orbit_reverse.cpp
+@@ -0,0 +1,72 @@
++/**
++ * @file tests/unit/test_orbit_reverse.cpp
++ * @brief ORBIT: reverse mode helpers (parsing, validation, command lines).
++ */
++#include "../tests_common.h"
++
++#include <algorithm>
++#include <src/orbit/reverse_mode.h>
++
++using namespace orbit::reverse;
++
++TEST(OrbitReverse, ParsesAdbDevices) {
++  auto d = parse_devices(
++    "* daemon started successfully\r\nList of devices attached\r\n"
++    "192.168.16.101:40123\tdevice product:x model:Vaio_TL10 device:y transport_id:1\r\n"
++    "adb-4AG69W71F-4fzcl1._adb-tls-connect._tcp\tunauthorized\r\n\r\n"
++  );
++  ASSERT_EQ(d.size(), 2u);
++  EXPECT_EQ(d[0].serial, "192.168.16.101:40123");
++  EXPECT_EQ(d[0].state, "device");
++  EXPECT_EQ(d[0].model, "Vaio TL10");
++  EXPECT_EQ(d[1].state, "unauthorized");
++  EXPECT_EQ(d[1].model, "");
++  EXPECT_TRUE(parse_devices("List of devices attached\n\n").empty());
++}
++
++TEST(OrbitReverse, ValidatesInputs) {
++  EXPECT_TRUE(valid_hostport("192.168.1.5:41234"));
++  EXPECT_FALSE(valid_hostport("192.168.1.5"));
++  EXPECT_FALSE(valid_hostport("192.168.1.256:5555"));
++  EXPECT_FALSE(valid_hostport("192.168.1.5:0"));
++  EXPECT_FALSE(valid_hostport("192.168.1.5:70000"));
++  EXPECT_FALSE(valid_hostport("1.2.3.4:5555 & calc"));
++  EXPECT_TRUE(valid_pair_code("123456"));
++  EXPECT_FALSE(valid_pair_code("12345"));
++  EXPECT_FALSE(valid_pair_code("12345a"));
++  EXPECT_TRUE(valid_serial("adb-4AG69W71F-4fzcl1._adb-tls-connect._tcp"));
++  EXPECT_TRUE(valid_serial("192.168.1.5:5555"));
++  EXPECT_FALSE(valid_serial(""));
++  EXPECT_FALSE(valid_serial("a b"));
++  EXPECT_FALSE(valid_serial("a\"&calc"));
++}
++
++TEST(OrbitReverse, BuildsScrcpyArgsWithinRanges) {
++  MirrorOptions o;
++  auto a = scrcpy_args("192.168.1.5:5555", o);
++  EXPECT_EQ(a[0], "-s");
++  EXPECT_EQ(a[1], "192.168.1.5:5555");
++  EXPECT_NE(std::find(a.begin(), a.end(), "--video-bit-rate=8M"), a.end());
++  EXPECT_NE(std::find(a.begin(), a.end(), "--max-fps=60"), a.end());
++  EXPECT_NE(std::find(a.begin(), a.end(), "--stay-awake"), a.end());
++  EXPECT_EQ(std::find(a.begin(), a.end(), "--no-audio"), a.end());
++
++  o.audio = false;
++  o.bitrate_mbps = 9999;
++  o.max_size = 10;
++  o.max_fps = 1;
++  o.turn_screen_off = true;
++  auto b = scrcpy_args("x", o);
++  EXPECT_NE(std::find(b.begin(), b.end(), "--no-audio"), b.end());
++  EXPECT_NE(std::find(b.begin(), b.end(), "--video-bit-rate=100M"), b.end());
++  EXPECT_NE(std::find(b.begin(), b.end(), "--max-size=320"), b.end());
++  EXPECT_NE(std::find(b.begin(), b.end(), "--max-fps=10"), b.end());
++  EXPECT_NE(std::find(b.begin(), b.end(), "--turn-screen-off"), b.end());
++}
++
++TEST(OrbitReverse, QuotesCommandLine) {
++  EXPECT_EQ(quote_command("C:\\a b\\scrcpy.exe", {"-s", "x"}), "\"C:\\a b\\scrcpy.exe\" -s x");
++  EXPECT_EQ(quote_command("a", {"--window-title=Orbit - celular"}), "a \"--window-title=Orbit - celular\"");
++  EXPECT_EQ(quote_command("a", {"say \"hi\""}), "a \"say \\\"hi\\\"\"");
++  EXPECT_EQ(quote_command("a", {"c:\\dir with space\\"}), "a \"c:\\dir with space\\\\\"");
++}
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,216 @@
+From ea2f417ab4fec3938921c8739125a58159df5d4f Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:39:01 -0300
+Subject: [PATCH 26/28] feat(web): Duvo images served before login, device rows
+ with access levels, auto refresh
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/confighttp.cpp                            | 25 ++++++++
+ src_assets/common/assets/web/pin.html         | 62 ++++++++++++++-----
+ .../assets/web/public/assets/css/duvo.css     |  9 +++
+ .../assets/web/public/assets/locale/en.json   |  9 ++-
+ .../web/public/assets/locale/pt_BR.json       |  9 ++-
+ 5 files changed, 96 insertions(+), 18 deletions(-)
+
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 65db4d9f..755d50c8 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -511,6 +511,30 @@ namespace confighttp {
+     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
+   }
+ 
++  /**
++   * @brief ORBIT: serve the Duvo images (logo, favicon) so they also load on the login page.
++   */
++  void getDuvoImage(resp_https_t response, req_https_t request) {
++    print_req(request);
++    std::string name = request->path.substr(std::string("/images/").size());
++    std::string type = "image/png";
++    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".svg") == 0) {
++      type = "image/svg+xml";
++    } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".ico") == 0) {
++      type = "image/x-icon";
++    }
++    std::ifstream in(std::string(WEB_DIR "images/") + name, std::ios::binary);
++    if (!in) {
++      not_found(response, request);
++      return;
++    }
++    SimpleWeb::CaseInsensitiveMultimap headers;
++    headers.emplace("Content-Type", type);
++    headers.emplace("X-Frame-Options", "DENY");
++    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
++    response->write(SimpleWeb::StatusCode::success_ok, in, headers);
++  }
++
+   /**
+    * @brief Check if a path is a child of another path.
+    * @param base The base path.
+@@ -1678,6 +1702,7 @@ namespace confighttp {
+     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
+     server.resource["^/images/apollo.ico$"]["GET"] = getFaviconImage;
+     server.resource["^/images/logo-apollo-45.png$"]["GET"] = getApolloLogoImage;
++    server.resource["^/images/duvo[A-Za-z0-9_-]*\\.(png|svg|ico)$"]["GET"] = getDuvoImage;  // ORBIT:
+     server.resource["^/assets\\/.+$"]["GET"] = getNodeModules;
+     server.config.reuse_address = true;
+     server.config.address = net::af_to_any_address_string(address_family);
+diff --git a/src_assets/common/assets/web/pin.html b/src_assets/common/assets/web/pin.html
+index 579bf27b..640faf36 100644
+--- a/src_assets/common/assets/web/pin.html
++++ b/src_assets/common/assets/web/pin.html
+@@ -40,15 +40,15 @@
+     <div class="card duvo-clients">
+       <div class="card-body">
+         <div class="p-2">
+-          <div class="d-flex justify-content-end align-items-center">
+-            <h2 id="unpair" class="me-auto">{{ $t('pin.device_management') }}</h2>
+-            <button class="btn btn-danger" :disabled="unpairAllPressed" @click="unpairAll">
++          <div class="d-flex align-items-center">
++            <div class="me-auto">
++              <h2 id="unpair" class="mb-1">{{ $t('pin.duvo_clients_title') }}</h2>
++              <p class="text-secondary mb-0">{{ $t('pin.duvo_clients_desc') }}</p>
++            </div>
++            <button class="btn btn-sm btn-outline-danger" :disabled="unpairAllPressed" @click="unpairAll">
+               {{ $t('pin.unpair_all') }}
+             </button>
+           </div>
+-          <br />
+-          <p class="mb-0">{{ $t('pin.device_management_desc') }}</p>
+-          <p class="mb-0">{{ $t('pin.device_management_warning') }} <a href="https://github.com/ClassicOldSong/Apollo/wiki/Permission-System" target="_blank">{{ $t('_common.learn_more') }}</a></p>
+           <div id="apply-alert" class="alert alert-success d-flex align-items-center mt-3" :style="{ 'display': (showApplyMessage ? 'flex !important': 'none !important') }">
+             <div class="me-2"><b>{{ $t('_common.success') }}</b> {{ $t('pin.unpair_single_success') }}</div>
+             <button class="btn btn-success ms-auto apply" @click="clickedApplyBanner">{{ $t('_common.dismiss') }}</button>
+@@ -172,17 +172,21 @@
+               </button>
+             </div>
+           </div>
+-          <div v-else class="list-group-item d-flex align-items-center">
+-            <div class="p-2 flex-grow-1 d-flex align-items-center">
+-              <span class="badge" :class="client.perm >= 0x04000000 ? 'bg-danger' : 'bg-primary'">
+-                {{ orbitPresetName(client.perm) }} [ {{permToStr(client.perm)}} ]
+-              </span>
+-              &nbsp;
+-              <span class="me-2">{{client.name != "" ? client.name : $t('pin.unpair_single_unknown')}}</span>
++          <div v-else class="list-group-item duvo-device">
++            <div class="duvo-device-icon"><i class="fas fa-mobile-screen"></i></div>
++            <div class="duvo-device-name">
++              <strong>{{ client.name != "" ? client.name : $t('pin.unpair_single_unknown') }}</strong>
++              <small :class="client.connected ? 'text-success' : 'text-secondary'">{{ client.connected ? $t('pin.duvo_connected') : $t('pin.duvo_paired') }}</small>
++            </div>
++            <div class="duvo-segmented">
++              <button v-for="p in orbitPresets" type="button" :class="{on: client.perm === p.perm}" :title="$t(`pin.orbit_preset_${p.id}_desc`)" @click="setPreset(client, p.perm)">{{ $t(`pin.orbit_preset_${p.id}`) }}</button>
++              <span v-if="!orbitPresets.some(p => p.perm === client.perm)" class="on">{{ $t('pin.orbit_preset_custom') }}</span>
++            </div>
++            <div class="duvo-device-actions">
++              <button v-if="client.connected" class="btn btn-sm btn-outline-secondary" :title="$t('pin.duvo_disconnect')" @click="disconnectClient(client.uuid)"><i class="fas fa-link-slash"></i></button>
++              <button class="btn btn-sm btn-outline-secondary" :title="$t('pin.duvo_advanced_edit')" @click="editClient(client)"><i class="fas fa-sliders"></i></button>
++              <button class="btn btn-sm btn-outline-danger" :title="$t('pin.duvo_remove')" @click="unpairSingle(client.uuid)"><i class="fas fa-trash"></i></button>
+             </div>
+-            <div v-if="client.connected" class="me-2 btn btn-warning" @click="disconnectClient(client.uuid)"><i class="fas fa-link-slash"></i></div>
+-            <div class="me-2 btn btn-primary" @click="editClient(client)"><i class="fas fa-edit"></i></div>
+-            <div class="me-2 btn btn-danger" @click="unpairSingle(client.uuid)"><i class="fas fa-trash"></i></div>
+           </div>
+         </template>
+       </ul>
+@@ -498,6 +502,7 @@
+       this.refreshClients();
+       this.revRefresh();
+       this.generateOrbitQR();
++      setInterval(() => { if (!currentEditingClient) this.refreshClients(); }, 4000);
+     },
+     methods: {
+       switchTab(currentTab) {
+@@ -709,6 +714,31 @@
+         client.editEnableLegacyOrdering = client.enable_legacy_ordering;
+         client.editAlwaysUseVirtualDisplay = client.always_use_virtual_display;
+       },
++      setPreset(client, perm) {
++        if (client.perm === perm) return;
++        const body = {
++          uuid: client.uuid,
++          name: client.name,
++          display_mode: (client.display_mode || '').trim(),
++          allow_client_commands: client.allow_client_commands,
++          enable_legacy_ordering: client.enable_legacy_ordering,
++          always_use_virtual_display: client.always_use_virtual_display,
++          perm: perm & permissionMapping._all,
++          do: client.do || [],
++          undo: client.undo || []
++        };
++        const before = client.perm;
++        client.perm = perm;
++        fetch("./api/clients/update", {
++          credentials: 'include',
++          headers: { 'Content-Type': 'application/json' },
++          method: 'POST',
++          body: JSON.stringify(body)
++        })
++        .then(resp => resp.json())
++        .then(resp => { if (!resp.status) throw new Error(resp.message); })
++        .catch(err => { client.perm = before; alert(this.i18n.t('pin.save_client_error') + err); });
++      },
+       saveClient(client) {
+         client.editing = false;
+         currentEditingClient = null;
+diff --git a/src_assets/common/assets/web/public/assets/css/duvo.css b/src_assets/common/assets/web/public/assets/css/duvo.css
+index 71d62574..3532b003 100644
+--- a/src_assets/common/assets/web/public/assets/css/duvo.css
++++ b/src_assets/common/assets/web/public/assets/css/duvo.css
+@@ -145,3 +145,12 @@ html main[role=main] { max-width: 520px !important; width: 100%; margin: 8vh aut
+ html main[role=main] .card { width: 100%; padding: 28px !important; }
+ html main[role=main] h1 { display: flex; align-items: center; justify-content: center; gap: 14px; font-size: 28px; text-align: center; }
+ html main[role=main] h1 img { height: 48px; width: 48px; }
++
++/* Device rows (concept): icon, name and status, access levels as a segmented control, quiet actions. */
++html .duvo-device { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 16px 22px; }
++html .duvo-device-icon { width: 40px; height: 40px; border-radius: 12px; background: var(--bs-secondary-bg); display: flex; align-items: center; justify-content: center; flex: 0 0 40px; }
++html .duvo-device-name { display: flex; flex-direction: column; flex: 1 1 160px; min-width: 0; }
++html .duvo-segmented { display: flex; gap: 4px; padding: 4px; border-radius: 14px; background: var(--bs-body-bg); border: 1px solid var(--bs-border-color); }
++html .duvo-segmented button, html .duvo-segmented span { height: 36px; padding: 0 12px; border-radius: 10px; border: none; background: transparent; color: var(--bs-secondary-color); font-size: 13px; display: inline-flex; align-items: center; }
++html .duvo-segmented .on { background: #f2851f; color: #1a1204; font-weight: 600; }
++html .duvo-device-actions { display: flex; gap: 6px; }
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index c6b045f9..98483e16 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -593,7 +593,14 @@
+     "orbit_rev_failed": "Failed",
+     "duvo_title": "Devices",
+     "duvo_subtitle": "Who can control this PC, and how far.",
+-    "duvo_advanced": "Advanced: pair with a PIN or a Moonlight client"
++    "duvo_advanced": "Advanced: pair with a PIN or a Moonlight client",
++    "duvo_clients_title": "Connected devices",
++    "duvo_clients_desc": "Choose what each device is allowed to do on this PC.",
++    "duvo_connected": "Connected now",
++    "duvo_paired": "Paired",
++    "duvo_disconnect": "Disconnect",
++    "duvo_advanced_edit": "Advanced permissions and name",
++    "duvo_remove": "Remove device"
+   },
+   "resource_card": {
+     "github_discussions": "GitHub Discussions",
+diff --git a/src_assets/common/assets/web/public/assets/locale/pt_BR.json b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+index 0106945f..10b90daa 100644
+--- a/src_assets/common/assets/web/public/assets/locale/pt_BR.json
++++ b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+@@ -547,7 +547,14 @@
+     "orbit_rev_failed": "Falhou",
+     "duvo_title": "Aparelhos",
+     "duvo_subtitle": "Quem pode controlar este PC, e até onde.",
+-    "duvo_advanced": "Avançado: parear com PIN ou com um cliente Moonlight"
++    "duvo_advanced": "Avançado: parear com PIN ou com um cliente Moonlight",
++    "duvo_clients_title": "Dispositivos conectados",
++    "duvo_clients_desc": "Escolha o que cada aparelho pode fazer neste PC.",
++    "duvo_connected": "Conectado agora",
++    "duvo_paired": "Pareado",
++    "duvo_disconnect": "Desconectar",
++    "duvo_advanced_edit": "Permissões avançadas e nome",
++    "duvo_remove": "Remover aparelho"
+   },
+   "resource_card": {
+     "github_discussions": "Discussões no GitHub",
+-- 
+2.55.0.windows.5
+

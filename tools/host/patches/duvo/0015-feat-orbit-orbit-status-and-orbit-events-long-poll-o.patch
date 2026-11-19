@@ -1,0 +1,1079 @@
+From d415cd6b8f31e24fd3409bca4a19ba893a33b38e Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:58:24 -0300
+Subject: [PATCH 15/28] feat(orbit): /orbit/status and /orbit/events long-poll
+ on the HTTPS API
+
+StatusTracker polls a StatusSource every 500 ms (only while clients are
+active), bumps seq on change and answers long-poll waiters on change or
+timeout (max 25 s, one pending per client uuid; a new wait answers the old).
+Responses are held asynchronously. Windows source: foreground window title
+and process name, Core Audio master volume/mute, SMTC media via C++/WinRT;
+failures leave fields empty. Routes require the view permission and are
+registered only on the mTLS server.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake  |   4 +
+ cmake/compile_definitions/windows.cmake |   1 +
+ src/nvhttp.cpp                          |   2 +
+ src/orbit/api_routes.cpp                | 101 +++++++++++
+ src/orbit/api_routes.h                  | 111 ++++++++++++
+ src/orbit/platform_status_win.cpp       | 210 ++++++++++++++++++++++
+ src/orbit/status_tracker.cpp            | 193 ++++++++++++++++++++
+ src/orbit/status_tracker.h              | 122 +++++++++++++
+ tests/unit/test_status_tracker.cpp      | 223 ++++++++++++++++++++++++
+ 9 files changed, 967 insertions(+)
+ create mode 100644 src/orbit/api_routes.cpp
+ create mode 100644 src/orbit/api_routes.h
+ create mode 100644 src/orbit/platform_status_win.cpp
+ create mode 100644 src/orbit/status_tracker.cpp
+ create mode 100644 src/orbit/status_tracker.h
+ create mode 100644 tests/unit/test_status_tracker.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index eb1aa751..03daba23 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -116,6 +116,10 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/pair_qr.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/unicode_events.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/unicode_events.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/status_tracker.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/status_tracker.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/api_routes.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/api_routes.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/cmake/compile_definitions/windows.cmake b/cmake/compile_definitions/windows.cmake
+index 7fe81436..ab06f309 100644
+--- a/cmake/compile_definitions/windows.cmake
++++ b/cmake/compile_definitions/windows.cmake
+@@ -63,6 +63,7 @@ set(PLATFORM_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.h"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/platform_status_win.cpp"  # ORBIT: status source (foreground window, volume, SMTC)
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda-ioctl.h"
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda.h"
+         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index f9787879..77699f46 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -31,6 +31,7 @@
+ #include "nvhttp.h"
+ #include "orbit/otp_slot.h"  // ORBIT:
+ #include "orbit/client_perm.h"  // ORBIT:
++#include "orbit/api_routes.h"  // ORBIT:
+ #include "platform/common.h"
+ #include "process.h"
+ #include "rtsp.h"
+@@ -1734,6 +1735,7 @@ namespace nvhttp {
+     https_server.resource["^/cancel$"]["GET"] = cancel;
+     https_server.resource["^/actions/clipboard$"]["GET"] = getClipboard;
+     https_server.resource["^/actions/clipboard$"]["POST"] = setClipboard;
++    auto orbit_api = orbit::register_api(https_server);  // ORBIT: /orbit/status, /orbit/events (HTTPS only)
+ 
+     https_server.config.reuse_address = true;
+     https_server.config.address = net::af_to_any_address_string(address_family);
+diff --git a/src/orbit/api_routes.cpp b/src/orbit/api_routes.cpp
+new file mode 100644
+index 00000000..e60fac58
+--- /dev/null
++++ b/src/orbit/api_routes.cpp
+@@ -0,0 +1,101 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/api_routes.cpp
++ * @brief Orbit HTTPS API (/orbit/...) on the nvhttp mTLS server.
++ */
++#include "api_routes.h"
++
++#include "client_perm.h"
++
++#include <algorithm>
++#include <charconv>
++#include <cstdint>
++#include <nlohmann/json.hpp>
++
++namespace orbit {
++  namespace {
++    /// 0 = allowed, else the HTTP status to answer with.
++    int check_view(const crypto::named_cert_t *cert) {
++      if (cert == nullptr) {
++        return 401;
++      }
++      return has_perm(cert, crypto::PERM::view) ? 0 : 403;
++    }
++
++    bool parse_u64(const std::string &s, uint64_t &out) {
++      if (s.empty()) {
++        return false;
++      }
++      auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
++      return ec == std::errc {} && p == s.data() + s.size();
++    }
++  }  // namespace
++
++  std::string status_json(const Status &s) {
++    nlohmann::json j;
++    j["seq"] = s.seq;
++    j["activeApp"] = s.active_app;
++    j["windowTitle"] = s.window_title;
++    j["media"] = {{"title", s.media_title}, {"artist", s.media_artist}, {"app", s.media_app}, {"playing", s.media_playing}};
++    nlohmann::json level = nullptr;
++    if (s.volume >= 0) {
++      level = s.volume;
++    }
++    j["volume"] = {{"level", level}, {"muted", s.muted}};
++    // Titles come from other programs and may hold invalid UTF-8: replace instead of throwing.
++    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
++  }
++
++  ApiReply status_reply(const crypto::named_cert_t *cert, StatusTracker &tracker) {
++    if (int err = check_view(cert)) {
++      return {err, {}};
++    }
++    tracker.note_activity();
++    tracker.refresh_if_stale(std::chrono::seconds {1});
++    return {200, status_json(tracker.current())};
++  }
++
++  EventsRequest parse_events_request(const crypto::named_cert_t *cert, const std::map<std::string, std::string> &query) {
++    EventsRequest r;
++    if (int err = check_view(cert)) {
++      r.error_status = err;
++      return r;
++    }
++
++    // No `since`: the client has nothing yet, answer at once with the current status.
++    auto since = query.find("since");
++    if (since == query.end()) {
++      r.since = UINT64_MAX;
++    } else if (!parse_u64(since->second, r.since)) {
++      r.error_status = 400;
++      return r;
++    }
++
++    auto timeout = query.find("timeout");
++    if (timeout != query.end()) {
++      uint64_t secs = 0;
++      if (!parse_u64(timeout->second, secs)) {
++        r.error_status = 400;
++        return r;
++      }
++      r.timeout = std::chrono::seconds {std::min<uint64_t>(secs, kMaxEventsTimeout.count())};
++    }
++    return r;
++  }
++}  // namespace orbit
+diff --git a/src/orbit/api_routes.h b/src/orbit/api_routes.h
+new file mode 100644
+index 00000000..81d46d49
+--- /dev/null
++++ b/src/orbit/api_routes.h
+@@ -0,0 +1,111 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/api_routes.h
++ * @brief Orbit HTTPS API (/orbit/...) on the nvhttp mTLS server.
++ */
++#pragma once
++
++#include "src/crypto.h"
++#include "status_tracker.h"
++
++#include <chrono>
++#include <map>
++#include <Simple-Web-Server/status_code.hpp>
++#include <memory>
++#include <string>
++
++namespace orbit {
++  /// Long-poll timeout cap (spec §10.6).
++  inline constexpr std::chrono::seconds kMaxEventsTimeout {25};
++
++  struct ApiReply {
++    int status;  ///< HTTP status code
++    std::string body;  ///< JSON (empty for errors)
++  };
++
++  /// JSON for a status: {seq, activeApp, windowTitle, media:{title,artist,app,playing}, volume:{level,muted}}.
++  std::string status_json(const Status &s);
++
++  /// GET /orbit/status: 401 unknown client, 403 without `view`, 200 + JSON otherwise.
++  ApiReply status_reply(const crypto::named_cert_t *cert, StatusTracker &tracker);
++
++  struct EventsRequest {
++    int error_status = 0;  ///< 0 = ok, else HTTP status to answer with
++    uint64_t since = 0;
++    std::chrono::milliseconds timeout {kMaxEventsTimeout};
++  };
++
++  /// GET /orbit/events?since=&timeout=: validate permission and parameters (timeout clamped to 25 s).
++  EventsRequest parse_events_request(const crypto::named_cert_t *cert, const std::map<std::string, std::string> &query);
++
++  /// Keeps the tracker alive for the server's lifetime; destroying it stops polling and answers pending waits.
++  struct ApiHandle {
++    std::shared_ptr<StatusTracker> tracker;
++
++    ~ApiHandle() {
++      if (tracker) {
++        tracker->shutdown();
++      }
++    }
++  };
++
++  /**
++   * @brief Register the /orbit/ routes on the nvhttp HTTPS (mTLS) server. Never call this for the plain HTTP server.
++   * The verified client is in request->userp (set by the server's certificate check).
++   */
++  template<class Server>
++  std::unique_ptr<ApiHandle> register_api(Server &server) {
++    auto handle = std::make_unique<ApiHandle>();
++    handle->tracker = std::make_shared<StatusTracker>(make_platform_status_source());
++    handle->tracker->start();
++    auto tracker = handle->tracker;
++
++    server.resource["^/orbit/status$"]["GET"] = [tracker](auto response, auto request) {
++      auto cert = static_cast<const crypto::named_cert_t *>(request->userp.get());
++      auto reply = status_reply(cert, *tracker);
++      if (reply.status != 200) {
++        response->write(static_cast<SimpleWeb::StatusCode>(reply.status));
++        response->close_connection_after_response = true;
++        return;
++      }
++      response->write(SimpleWeb::StatusCode::success_ok, reply.body, {{"Content-Type", "application/json"}});
++    };
++
++    server.resource["^/orbit/events$"]["GET"] = [tracker](auto response, auto request) {
++      auto cert = static_cast<const crypto::named_cert_t *>(request->userp.get());
++      std::map<std::string, std::string> query;
++      for (auto &[k, v] : request->parse_query_string()) {
++        query[k] = v;
++      }
++      auto ev = parse_events_request(cert, query);
++      if (ev.error_status != 0) {
++        response->write(static_cast<SimpleWeb::StatusCode>(ev.error_status));
++        response->close_connection_after_response = true;
++        return;
++      }
++      tracker->refresh_if_stale(std::chrono::seconds {1});
++      // Async: keep `response` in the callback; it is sent when the callback is answered and released.
++      tracker->wait_change(ev.since, ev.timeout, [response](Status s) {
++        response->write(SimpleWeb::StatusCode::success_ok, status_json(s), {{"Content-Type", "application/json"}});
++      }, cert->uuid);
++    };
++
++    return handle;
++  }
++}  // namespace orbit
+diff --git a/src/orbit/platform_status_win.cpp b/src/orbit/platform_status_win.cpp
+new file mode 100644
+index 00000000..6d76df9d
+--- /dev/null
++++ b/src/orbit/platform_status_win.cpp
+@@ -0,0 +1,210 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/platform_status_win.cpp
++ * @brief Windows StatusSource: foreground window + process, Core Audio master volume, SMTC media.
++ *
++ * Every call is best effort: the host may run as SYSTEM in the user session, where some sources fail.
++ * A failing source leaves its fields empty; nothing here throws.
++ */
++#include "status_tracker.h"
++
++// clang-format off
++#include <windows.h>
++#include <endpointvolume.h>
++#include <mmdeviceapi.h>
++// clang-format on
++
++#include <winrt/windows.foundation.h>
++#include <winrt/windows.media.control.h>
++
++#include <chrono>
++#include <cmath>
++#include <stdexcept>
++#include <string>
++
++namespace orbit {
++  namespace {
++    namespace smtc = winrt::Windows::Media::Control;
++
++    std::string to_utf8(const wchar_t *w, int len) {
++      if (len <= 0) {
++        return {};
++      }
++      int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
++      if (n <= 0) {
++        return {};
++      }
++      std::string out(n, '\0');
++      WideCharToMultiByte(CP_UTF8, 0, w, len, out.data(), n, nullptr, nullptr);
++      return out;
++    }
++
++    std::string to_utf8(const winrt::hstring &h) {
++      return to_utf8(h.c_str(), static_cast<int>(h.size()));
++    }
++
++    /// Keep this thread in the MTA for its whole life (cached WinRT/COM objects stay valid between polls).
++    struct ComThread {
++      bool ok;
++
++      ComThread():
++          ok {SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))} {}
++
++      ~ComThread() {
++        if (ok) {
++          CoUninitialize();
++        }
++      }
++    };
++
++    void read_foreground(Status &s) {
++      HWND hwnd = GetForegroundWindow();
++      if (hwnd == nullptr) {
++        return;
++      }
++      wchar_t title[512];
++      int len = GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
++      s.window_title = to_utf8(title, len);
++
++      DWORD pid = 0;
++      GetWindowThreadProcessId(hwnd, &pid);
++      if (pid == 0) {
++        return;
++      }
++      HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++      if (proc == nullptr) {
++        return;
++      }
++      wchar_t path[MAX_PATH * 2];
++      DWORD size = static_cast<DWORD>(std::size(path));
++      if (QueryFullProcessImageNameW(proc, 0, path, &size) && size > 0) {
++        std::wstring_view full {path, size};
++        auto slash = full.find_last_of(L"\\/");
++        auto base = slash == std::wstring_view::npos ? full : full.substr(slash + 1);
++        s.active_app = to_utf8(base.data(), static_cast<int>(base.size()));
++      }
++      CloseHandle(proc);
++    }
++
++    void read_volume(Status &s) {
++      IMMDeviceEnumerator *enumerator = nullptr;
++      IMMDevice *device = nullptr;
++      IAudioEndpointVolume *endpoint = nullptr;
++      if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void **>(&enumerator))) &&
++          SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
++          SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&endpoint)))) {
++        float level = 0.0f;
++        BOOL mute = FALSE;
++        if (SUCCEEDED(endpoint->GetMasterVolumeLevelScalar(&level))) {
++          s.volume = static_cast<int>(std::lround(level * 100.0f));
++        }
++        if (SUCCEEDED(endpoint->GetMute(&mute))) {
++          s.muted = mute != FALSE;
++        }
++      }
++      if (endpoint) {
++        endpoint->Release();
++      }
++      if (device) {
++        device->Release();
++      }
++      if (enumerator) {
++        enumerator->Release();
++      }
++    }
++
++    class WinStatusSource: public StatusSource {
++    public:
++      Status read() override {
++        thread_local ComThread com;
++        Status s;
++        try {
++          read_foreground(s);
++        } catch (...) {
++        }
++        try {
++          read_volume(s);
++        } catch (...) {
++        }
++        read_media(s);
++        return s;
++      }
++
++    private:
++      static constexpr auto kAsyncWait = std::chrono::milliseconds {400};
++      static constexpr auto kRetryAfterFailure = std::chrono::seconds {10};
++
++      template<class Op>
++      static bool finished(const Op &op) {
++        return op.wait_for(kAsyncWait) == winrt::Windows::Foundation::AsyncStatus::Completed;
++      }
++
++      void read_media(Status &s) {
++        auto now = std::chrono::steady_clock::now();
++        if (!manager_ && now < retry_at_) {
++          return;
++        }
++        try {
++          if (!manager_) {
++            auto op = smtc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
++            if (!finished(op)) {
++              op.Cancel();
++              throw std::runtime_error("SMTC manager request timed out");
++            }
++            manager_ = op.GetResults();
++          }
++          auto session = manager_.GetCurrentSession();
++          if (!session) {
++            return;
++          }
++          s.media_app = to_utf8(session.SourceAppUserModelId());
++          auto info = session.GetPlaybackInfo();
++          if (info) {
++            s.media_playing = info.PlaybackStatus() == smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
++          }
++          auto props_op = session.TryGetMediaPropertiesAsync();
++          if (finished(props_op)) {
++            auto props = props_op.GetResults();
++            if (props) {
++              s.media_title = to_utf8(props.Title());
++              s.media_artist = to_utf8(props.Artist());
++            }
++          } else {
++            props_op.Cancel();
++          }
++        } catch (...) {
++          // e.g. SMTC unavailable for this process (SYSTEM context): no media, retry later
++          manager_ = nullptr;
++          retry_at_ = now + kRetryAfterFailure;
++          s.media_title.clear();
++          s.media_artist.clear();
++          s.media_app.clear();
++          s.media_playing = false;
++        }
++      }
++
++      smtc::GlobalSystemMediaTransportControlsSessionManager manager_ {nullptr};
++      std::chrono::steady_clock::time_point retry_at_ {};
++    };
++  }  // namespace
++
++  std::unique_ptr<StatusSource> make_platform_status_source() {
++    return std::make_unique<WinStatusSource>();
++  }
++}  // namespace orbit
+diff --git a/src/orbit/status_tracker.cpp b/src/orbit/status_tracker.cpp
+new file mode 100644
+index 00000000..372e39f5
+--- /dev/null
++++ b/src/orbit/status_tracker.cpp
+@@ -0,0 +1,193 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/status_tracker.cpp
++ * @brief PC status (active window, media, volume) with change sequence and long-poll waiters.
++ */
++#include "status_tracker.h"
++
++#include <utility>
++
++namespace orbit {
++  namespace {
++    /// The poll thread keeps reading the system only while a client used the API recently.
++    constexpr auto kActiveWindow = std::chrono::seconds {60};
++  }  // namespace
++
++  bool Status::same_content(const Status &o) const {
++    return active_app == o.active_app && window_title == o.window_title && media_title == o.media_title &&
++           media_artist == o.media_artist && media_app == o.media_app && media_playing == o.media_playing &&
++           volume == o.volume && muted == o.muted;
++  }
++
++  StatusTracker::StatusTracker(std::unique_ptr<StatusSource> source, clock_fn clock):
++      source_ {std::move(source)},
++      clock_ {std::move(clock)} {
++  }
++
++  StatusTracker::~StatusTracker() {
++    shutdown();
++  }
++
++  Status StatusTracker::current() {
++    std::lock_guard lk {m_};
++    return status_;
++  }
++
++  void StatusTracker::poll_once() {
++    Status fresh;
++    {
++      std::lock_guard src_lk {source_m_};
++      try {
++        fresh = source_->read();
++      } catch (...) {
++        fresh = Status {};
++      }
++    }
++
++    std::vector<std::pair<callback, Status>> ready;
++    {
++      std::lock_guard lk {m_};
++      auto now = clock_();
++      if (!fresh.same_content(status_)) {
++        fresh.seq = status_.seq + 1;
++        status_ = std::move(fresh);
++      }
++      have_read_ = true;
++      last_read_ = now;
++
++      for (auto it = waiters_.begin(); it != waiters_.end();) {
++        if (it->since != status_.seq || it->deadline <= now) {
++          ready.emplace_back(std::move(it->done), status_);
++          it = waiters_.erase(it);
++        } else {
++          ++it;
++        }
++      }
++    }
++    for (auto &[done, s] : ready) {
++      done(std::move(s));
++    }
++  }
++
++  void StatusTracker::wait_change(uint64_t since, std::chrono::milliseconds timeout, callback done, const std::string &client_uuid) {
++    std::vector<callback> answer_now;
++    Status snapshot;
++    {
++      std::lock_guard lk {m_};
++      auto now = clock_();
++      last_activity_ = now;
++      snapshot = status_;
++
++      if (stopped_ || since != status_.seq || timeout <= std::chrono::milliseconds::zero()) {
++        answer_now.emplace_back(std::move(done));
++      } else {
++        if (!client_uuid.empty()) {
++          for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
++            if (it->client_uuid == client_uuid) {
++              answer_now.emplace_back(std::move(it->done));
++              waiters_.erase(it);
++              break;
++            }
++          }
++        }
++        waiters_.push_back(Waiter {since, now + timeout, std::move(done), client_uuid});
++      }
++    }
++    for (auto &cb : answer_now) {
++      cb(snapshot);
++    }
++  }
++
++  void StatusTracker::note_activity() {
++    std::lock_guard lk {m_};
++    last_activity_ = clock_();
++  }
++
++  void StatusTracker::refresh_if_stale(std::chrono::milliseconds max_age) {
++    bool stale;
++    {
++      std::lock_guard lk {m_};
++      stale = !have_read_ || clock_() - last_read_ > max_age;
++    }
++    if (stale) {
++      poll_once();
++    }
++  }
++
++  void StatusTracker::start(std::chrono::milliseconds interval) {
++    std::lock_guard lk {m_};
++    if (thread_.joinable() || stopped_) {
++      return;
++    }
++    thread_ = std::thread {[this, interval]() {
++      run(interval);
++    }};
++  }
++
++  void StatusTracker::run(std::chrono::milliseconds interval) {
++    std::unique_lock lk {m_};
++    while (!stopped_) {
++      cv_.wait_for(lk, interval, [this]() {
++        return stopped_;
++      });
++      if (stopped_) {
++        break;
++      }
++      bool active = !waiters_.empty() || clock_() - last_activity_ < kActiveWindow;
++      if (!active) {
++        continue;
++      }
++      lk.unlock();
++      poll_once();
++      lk.lock();
++    }
++  }
++
++  void StatusTracker::shutdown() {
++    std::vector<Waiter> pending;
++    Status snapshot;
++    {
++      std::lock_guard lk {m_};
++      stopped_ = true;
++      pending.swap(waiters_);
++      snapshot = status_;
++    }
++    cv_.notify_all();
++    if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
++      thread_.join();
++    }
++    for (auto &w : pending) {
++      w.done(snapshot);
++    }
++  }
++
++#ifndef _WIN32
++  namespace {
++    struct NullStatusSource: StatusSource {
++      Status read() override {
++        return {};
++      }
++    };
++  }  // namespace
++
++  std::unique_ptr<StatusSource> make_platform_status_source() {
++    return std::make_unique<NullStatusSource>();
++  }
++#endif
++}  // namespace orbit
+diff --git a/src/orbit/status_tracker.h b/src/orbit/status_tracker.h
+new file mode 100644
+index 00000000..67cbf802
+--- /dev/null
++++ b/src/orbit/status_tracker.h
+@@ -0,0 +1,122 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/status_tracker.h
++ * @brief PC status (active window, media, volume) with change sequence and long-poll waiters.
++ */
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace orbit {
++  /// Snapshot of the PC state shown in the remote-control status bar.
++  struct Status {
++    uint64_t seq = 0;  ///< incremented on every change
++    std::string active_app;  ///< foreground process image name (e.g. "chrome.exe")
++    std::string window_title;
++    std::string media_title;
++    std::string media_artist;
++    std::string media_app;  ///< SMTC source app id
++    bool media_playing = false;
++    int volume = -1;  ///< master volume 0..100, -1 when unknown
++    bool muted = false;
++
++    /// Compare everything except seq.
++    bool same_content(const Status &o) const;
++  };
++
++  /// Reads the current status from the system. Must never throw; unknown fields stay empty.
++  class StatusSource {
++  public:
++    virtual ~StatusSource() = default;
++    virtual Status read() = 0;
++  };
++
++  /// Platform source (Windows: foreground window, Core Audio, SMTC). Never null.
++  std::unique_ptr<StatusSource> make_platform_status_source();
++
++  class StatusTracker {
++  public:
++    using clock_fn = std::function<std::chrono::steady_clock::time_point()>;
++    using callback = std::function<void(Status)>;
++
++    explicit StatusTracker(std::unique_ptr<StatusSource> source, clock_fn clock = &std::chrono::steady_clock::now);
++    ~StatusTracker();
++
++    StatusTracker(const StatusTracker &) = delete;
++    StatusTracker &operator=(const StatusTracker &) = delete;
++
++    Status current();
++
++    /// Read the source once; seq grows only if something changed. Answers changed/expired waiters.
++    void poll_once();
++
++    /**
++     * @brief Call `done` once seq != since or after `timeout` (with the current status).
++     * Answers right away when `since` is already stale. At most one waiter per non-empty `client_uuid`:
++     * a new one replaces the old, which is answered immediately with the current status.
++     */
++    void wait_change(uint64_t since, std::chrono::milliseconds timeout, callback done, const std::string &client_uuid = {});
++
++    /// Mark API activity; the poll thread only reads the source while clients are active.
++    void note_activity();
++
++    /// Poll synchronously if the last read is older than max_age (used when the poll thread is idle).
++    void refresh_if_stale(std::chrono::milliseconds max_age);
++
++    /// Start the background poll thread.
++    void start(std::chrono::milliseconds interval = std::chrono::milliseconds {500});
++
++    /// Stop the poll thread and answer all pending waiters; later waits are answered immediately.
++    void shutdown();
++
++  private:
++    struct Waiter {
++      uint64_t since;
++      std::chrono::steady_clock::time_point deadline;
++      callback done;
++      std::string client_uuid;
++    };
++
++    void run(std::chrono::milliseconds interval);
++
++    std::unique_ptr<StatusSource> source_;
++    clock_fn clock_;
++
++    std::mutex m_;
++    Status status_;
++    bool have_read_ = false;
++    std::chrono::steady_clock::time_point last_read_ {};
++    std::chrono::steady_clock::time_point last_activity_ {};
++    std::vector<Waiter> waiters_;
++    bool stopped_ = false;
++
++    std::mutex source_m_;  ///< serializes source reads (poll thread vs. refresh_if_stale)
++
++    std::condition_variable cv_;
++    std::thread thread_;
++  };
++}  // namespace orbit
+diff --git a/tests/unit/test_status_tracker.cpp b/tests/unit/test_status_tracker.cpp
+new file mode 100644
+index 00000000..2cec7f70
+--- /dev/null
++++ b/tests/unit/test_status_tracker.cpp
+@@ -0,0 +1,223 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_status_tracker.cpp
++ * @brief Test src/orbit/status_tracker.* and src/orbit/api_routes.*
++ */
++#include "../tests_common.h"
++
++#include <nlohmann/json.hpp>
++#include <optional>
++#include <src/orbit/api_routes.h>
++#include <src/orbit/status_tracker.h>
++
++using namespace std::chrono_literals;
++
++namespace {
++  struct FakeSource: orbit::StatusSource {
++    orbit::Status *value;
++
++    explicit FakeSource(orbit::Status *v):
++        value {v} {}
++
++    orbit::Status read() override {
++      return *value;
++    }
++  };
++
++  struct FakeClock {
++    std::chrono::steady_clock::time_point now {std::chrono::steady_clock::time_point {} + 1000s};
++  };
++
++  struct Fixture {
++    orbit::Status src {};
++    FakeClock clk;
++    orbit::StatusTracker tracker {std::make_unique<FakeSource>(&src), [this]() {
++                                    return clk.now;
++                                  }};
++
++    Fixture() {
++      src.window_title = "A";
++      src.active_app = "a.exe";
++      src.volume = 50;
++      tracker.poll_once();
++    }
++  };
++}  // namespace
++
++TEST(StatusTracker, SeqOnlyIncrementsOnChange) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  f.tracker.poll_once();
++  f.tracker.poll_once();
++  EXPECT_EQ(f.tracker.current().seq, s0);
++
++  f.src.window_title = "B";
++  f.tracker.poll_once();
++  EXPECT_EQ(f.tracker.current().seq, s0 + 1);
++  EXPECT_EQ(f.tracker.current().window_title, "B");
++
++  f.tracker.poll_once();
++  EXPECT_EQ(f.tracker.current().seq, s0 + 1);
++
++  f.src.muted = true;
++  f.tracker.poll_once();
++  EXPECT_EQ(f.tracker.current().seq, s0 + 2);
++}
++
++TEST(StatusTracker, WaitAnswersOnChange) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  std::optional<orbit::Status> got;
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status s) {
++    got = s;
++  });
++  EXPECT_FALSE(got);
++
++  f.tracker.poll_once();  // nothing changed
++  EXPECT_FALSE(got);
++
++  f.src.window_title = "B";
++  f.tracker.poll_once();
++  ASSERT_TRUE(got);
++  EXPECT_EQ(got->seq, s0 + 1);
++  EXPECT_EQ(got->window_title, "B");
++}
++
++TEST(StatusTracker, WaitAnswersImmediatelyWhenSinceIsStale) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  std::optional<orbit::Status> got;
++  f.tracker.wait_change(s0 + 7, 25s, [&](orbit::Status s) {
++    got = s;
++  });
++  ASSERT_TRUE(got);
++  EXPECT_EQ(got->seq, s0);
++}
++
++TEST(StatusTracker, WaitTimesOutWithCurrent) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  std::optional<orbit::Status> got;
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status s) {
++    got = s;
++  });
++
++  f.clk.now += 24s;
++  f.tracker.poll_once();
++  EXPECT_FALSE(got);
++
++  f.clk.now += 1s;
++  f.tracker.poll_once();
++  ASSERT_TRUE(got);
++  EXPECT_EQ(got->seq, s0);
++  EXPECT_EQ(got->window_title, "A");
++}
++
++TEST(StatusTracker, NewWaitReplacesOldForSameClient) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  int first = 0, second = 0, other = 0;
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status s) {
++    ++first;
++    EXPECT_EQ(s.seq, s0);
++  }, "uuid-1");
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status) {
++    ++other;
++  }, "uuid-2");
++  EXPECT_EQ(first, 0);
++
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status) {
++    ++second;
++  }, "uuid-1");
++  EXPECT_EQ(first, 1);  // old one answered right away with the current status
++  EXPECT_EQ(second, 0);
++  EXPECT_EQ(other, 0);  // other clients are untouched
++
++  f.src.window_title = "B";
++  f.tracker.poll_once();
++  EXPECT_EQ(first, 1);
++  EXPECT_EQ(second, 1);
++  EXPECT_EQ(other, 1);
++}
++
++TEST(StatusTracker, ShutdownAnswersPendingAndLaterWaits) {
++  Fixture f;
++  auto s0 = f.tracker.current().seq;
++  int n = 0;
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status) {
++    ++n;
++  }, "u");
++  f.tracker.shutdown();
++  EXPECT_EQ(n, 1);
++  f.tracker.wait_change(s0, 25s, [&](orbit::Status) {
++    ++n;
++  }, "u");
++  EXPECT_EQ(n, 2);
++}
++
++TEST(OrbitApi, StatusRequiresView) {
++  orbit::Status src {};
++  src.window_title = "Doc - Editor";
++  src.active_app = "editor.exe";
++  src.volume = 30;
++  orbit::StatusTracker tracker {std::make_unique<FakeSource>(&src)};
++  tracker.poll_once();
++
++  crypto::named_cert_t no_view {};
++  no_view.perm = crypto::PERM::input_kbd;
++  EXPECT_EQ(orbit::status_reply(&no_view, tracker).status, 403);
++
++  EXPECT_EQ(orbit::status_reply(nullptr, tracker).status, 401);
++
++  crypto::named_cert_t viewer {};
++  viewer.perm = crypto::PERM::view;
++  auto r = orbit::status_reply(&viewer, tracker);
++  EXPECT_EQ(r.status, 200);
++  auto j = nlohmann::json::parse(r.body);
++  EXPECT_EQ(j["seq"].get<uint64_t>(), tracker.current().seq);
++  EXPECT_EQ(j["windowTitle"], "Doc - Editor");
++  EXPECT_EQ(j["activeApp"], "editor.exe");
++  EXPECT_EQ(j["volume"]["level"], 30);
++  EXPECT_EQ(j["volume"]["muted"], false);
++  EXPECT_EQ(j["media"]["playing"], false);
++  EXPECT_EQ(j["media"]["title"], "");
++}
++
++TEST(OrbitApi, EventsParamsRequireViewAndClampTimeout) {
++  crypto::named_cert_t no_view {};
++  no_view.perm = crypto::PERM::input_kbd;
++  EXPECT_EQ(orbit::parse_events_request(&no_view, {}).error_status, 403);
++  EXPECT_EQ(orbit::parse_events_request(nullptr, {}).error_status, 401);
++
++  crypto::named_cert_t viewer {};
++  viewer.perm = crypto::PERM::view;
++  auto r = orbit::parse_events_request(&viewer, {{"since", "5"}, {"timeout", "100"}});
++  EXPECT_EQ(r.error_status, 0);
++  EXPECT_EQ(r.since, 5u);
++  EXPECT_EQ(r.timeout, 25s);
++
++  r = orbit::parse_events_request(&viewer, {{"since", "5"}, {"timeout", "3"}});
++  EXPECT_EQ(r.timeout, 3s);
++
++  r = orbit::parse_events_request(&viewer, {{"since", "5"}});
++  EXPECT_EQ(r.timeout, 25s);
++
++  EXPECT_EQ(orbit::parse_events_request(&viewer, {{"since", "abc"}}).error_status, 400);
++  EXPECT_EQ(orbit::parse_events_request(&viewer, {{"since", "1"}, {"timeout", "-4"}}).error_status, 400);
++}
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,40 @@
+From b90a80004fc727202966c2f53c9c420cbf3e83d3 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:15:06 -0300
+Subject: [PATCH 08/28] fix(orbit): web UI default port 40989
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src_assets/common/assets/web/config.html              | 2 +-
+ src_assets/common/assets/web/configs/tabs/Network.vue | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src_assets/common/assets/web/config.html b/src_assets/common/assets/web/config.html
+index 1c638b6f..7477aee8 100644
+--- a/src_assets/common/assets/web/config.html
++++ b/src_assets/common/assets/web/config.html
+@@ -221,7 +221,7 @@
+             options: {
+               "upnp": "disabled",
+               "address_family": "ipv4",
+-              "port": 47989,
++              "port": 40989,  // ORBIT: porta base do Orbit
+               "origin_web_ui_allowed": "lan",
+               "external_ip": "",
+               "lan_encryption_mode": 0,
+diff --git a/src_assets/common/assets/web/configs/tabs/Network.vue b/src_assets/common/assets/web/configs/tabs/Network.vue
+index 0136817c..5c7a2238 100644
+--- a/src_assets/common/assets/web/configs/tabs/Network.vue
++++ b/src_assets/common/assets/web/configs/tabs/Network.vue
+@@ -7,7 +7,7 @@ const props = defineProps([
+   'config'
+ ])
+ 
+-const defaultMoonlightPort = 47989
++const defaultMoonlightPort = 40989  // ORBIT: porta base do Orbit
+ 
+ const config = ref(props.config)
+ const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
+-- 
+2.55.0.windows.5
+

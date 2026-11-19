@@ -1,0 +1,497 @@
+From c66058bc66cf6439cc029c938a3b084063676fbe Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:10:57 -0300
+Subject: [PATCH 27/28] feat(web): phone-on-PC card redesigned
+ (add/open/close/rotate/remove, plain-language errors, auto refresh); rotate
+ and disconnect endpoints; window title Duvo
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/confighttp.cpp                            |  31 +++-
+ src/orbit/reverse_mode.cpp                    |  34 +++-
+ src/orbit/reverse_mode.h                      |   6 +
+ src_assets/common/assets/web/pin.html         | 153 +++++++++++++-----
+ .../assets/web/public/assets/css/duvo.css     |   8 +
+ .../assets/web/public/assets/locale/en.json   |  51 +++++-
+ .../web/public/assets/locale/pt_BR.json       |  51 +++++-
+ tests/unit/test_orbit_reverse.cpp             |   2 +-
+ 8 files changed, 287 insertions(+), 49 deletions(-)
+
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 755d50c8..b3bf74ee 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -1322,7 +1322,12 @@ namespace confighttp {
+       nlohmann::json j;
+       j["tools"] = {{"adb", svc.has_tool("adb")}, {"scrcpy", svc.has_tool("scrcpy")}};
+       nlohmann::json devs = nlohmann::json::array();
+-      for (auto &d : svc.devices()) {
++      std::vector<orbit::reverse::AdbDevice> found;
++      auto res = svc.devices_result(found);
++      if (!res.ok && j["tools"]["adb"].get<bool>()) {
++        j["adb_error"] = res.output;
++      }
++      for (auto &d : found) {
+         devs.push_back({{"serial", d.serial}, {"state", d.state}, {"model", d.model}});
+       }
+       j["devices"] = devs;
+@@ -1392,6 +1397,28 @@ namespace confighttp {
+     send_response(response, nlohmann::json {{"ok", ok}, {"error", error}});
+   }
+ 
++  /// ORBIT: forget a wireless device. Body: {"serial": "..."}
++  void orbitReverseDisconnect(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    auto serial = body.value("serial", "");
++    reverse_service().stop(serial);
++    auto r = reverse_service().disconnect(serial);
++    send_response(response, nlohmann::json {{"ok", r.ok}, {"output", r.output}});
++  }
++
++  /// ORBIT: rotate the phone screen. Body: {"serial": "..."}
++  void orbitReverseRotate(resp_https_t response, req_https_t request) {
++    nlohmann::json body;
++    if (!reverse_prologue(response, request, body)) {
++      return;
++    }
++    auto r = reverse_service().rotate(body.value("serial", ""));
++    send_response(response, nlohmann::json {{"ok", r.ok}, {"output", r.output}});
++  }
++
+   /// ORBIT: close the phone window. Body: {"serial": "..."}
+   void orbitReverseStop(resp_https_t response, req_https_t request) {
+     nlohmann::json body;
+@@ -1680,6 +1707,8 @@ namespace confighttp {
+     server.resource["^/api/orbit/reverse/connect$"]["POST"] = orbitReverseConnect;  // ORBIT:
+     server.resource["^/api/orbit/reverse/start$"]["POST"] = orbitReverseStart;  // ORBIT:
+     server.resource["^/api/orbit/reverse/stop$"]["POST"] = orbitReverseStop;  // ORBIT:
++    server.resource["^/api/orbit/reverse/disconnect$"]["POST"] = orbitReverseDisconnect;  // ORBIT:
++    server.resource["^/api/orbit/reverse/rotate$"]["POST"] = orbitReverseRotate;  // ORBIT:
+     server.resource["^/api/apps$"]["GET"] = getApps;
+     server.resource["^/api/apps$"]["POST"] = saveApp;
+     server.resource["^/api/apps/reorder$"]["POST"] = reorderApps;
+diff --git a/src/orbit/reverse_mode.cpp b/src/orbit/reverse_mode.cpp
+index 3f221d4a..77aa15dc 100644
+--- a/src/orbit/reverse_mode.cpp
++++ b/src/orbit/reverse_mode.cpp
+@@ -98,7 +98,7 @@ namespace orbit::reverse {
+ 
+   std::vector<std::string> scrcpy_args(const std::string &serial, const MirrorOptions &raw) {
+     auto o = clamp(raw);
+-    std::vector<std::string> a {"-s", serial, "--window-title=Orbit - celular"s, "--video-bit-rate="s + std::to_string(o.bitrate_mbps) + "M"s, "--max-fps="s + std::to_string(o.max_fps)};
++    std::vector<std::string> a {"-s", serial, "--window-title=Duvo - celular"s, "--video-bit-rate="s + std::to_string(o.bitrate_mbps) + "M"s, "--max-fps="s + std::to_string(o.max_fps)};
+     if (o.max_size > 0) {
+       a.push_back("--max-size="s + std::to_string(o.max_size));
+     }
+@@ -241,6 +241,38 @@ namespace orbit::reverse {
+     return r.ok ? parse_devices(r.output) : std::vector<AdbDevice> {};
+   }
+ 
++  AdbResult Service::devices_result(std::vector<AdbDevice> &out) {
++    auto r = impl_->run_adb({"devices", "-l"}, 12s);
++    if (r.ok) {
++      out = parse_devices(r.output);
++    }
++    return r;
++  }
++
++  AdbResult Service::disconnect(const std::string &serial) {
++    if (!valid_serial(serial)) {
++      return {false, "invalid"};
++    }
++    return impl_->run_adb({"disconnect", serial}, 10s);
++  }
++
++  AdbResult Service::rotate(const std::string &serial) {
++    if (!valid_serial(serial)) {
++      return {false, "invalid"};
++    }
++    auto cur = impl_->run_adb({"-s", serial, "shell", "settings", "get", "system", "user_rotation"}, 10s);
++    if (!cur.ok) {
++      return cur;
++    }
++    int rot = 0;
++    try {
++      rot = std::stoi(cur.output);
++    } catch (...) {
++    }
++    impl_->run_adb({"-s", serial, "shell", "settings", "put", "system", "accelerometer_rotation", "0"}, 10s);
++    return impl_->run_adb({"-s", serial, "shell", "settings", "put", "system", "user_rotation", std::to_string((rot + 1) % 4)}, 10s);
++  }
++
+   AdbResult Service::pair(const std::string &hostport, const std::string &code) {
+     if (!valid_hostport(hostport) || !valid_pair_code(code)) {
+       return {false, "invalid"};
+diff --git a/src/orbit/reverse_mode.h b/src/orbit/reverse_mode.h
+index 0c17a260..14086ed4 100644
+--- a/src/orbit/reverse_mode.h
++++ b/src/orbit/reverse_mode.h
+@@ -63,6 +63,12 @@ namespace orbit::reverse {
+ 
+     bool has_tool(const std::string &name) const;
+     std::vector<AdbDevice> devices();
++    /// Like devices(), but also reports whether adb itself worked and what it printed (for error messages).
++    AdbResult devices_result(std::vector<AdbDevice> &out);
++    /// Disconnect a wireless device ("adb disconnect").
++    AdbResult disconnect(const std::string &serial);
++    /// Turns the phone screen 90 degrees clockwise (turns auto-rotate off). [serial] must pass valid_serial.
++    AdbResult rotate(const std::string &serial);
+     AdbResult pair(const std::string &hostport, const std::string &code);
+     AdbResult connect(const std::string &hostport);
+     /// Starts scrcpy for [serial]; false (with [error]) when a tool is missing or already running for it.
+diff --git a/src_assets/common/assets/web/pin.html b/src_assets/common/assets/web/pin.html
+index 640faf36..555e372b 100644
+--- a/src_assets/common/assets/web/pin.html
++++ b/src_assets/common/assets/web/pin.html
+@@ -196,39 +196,59 @@
+     </div>
+     </div>
+     <!-- ORBIT: reverse mode (phone screen on the PC via adb + scrcpy) -->
+-    <div class="card p-4 mb-4" id="orbit-reverse-card">
+-      <h2 class="mb-2">{{ $t('pin.orbit_rev_title') }}</h2>
+-      <p class="text-secondary">{{ $t('pin.orbit_rev_hint') }}</p>
+-      <div v-if="rev.tools && (!rev.tools.adb || !rev.tools.scrcpy)" class="alert alert-warning">{{ $t('pin.orbit_rev_missing') }}</div>
+-      <div v-if="rev.msg" class="alert alert-info" style="white-space: pre-wrap">{{ rev.msg }}</div>
+-      <div class="d-flex align-items-center mb-2">
+-        <strong class="flex-grow-1">{{ $t('pin.orbit_rev_title') }}</strong>
+-        <button class="btn btn-sm btn-outline-secondary" type="button" @click="revRefresh">{{ $t('pin.orbit_rev_refresh') }}</button>
++    <div class="card duvo-rev" id="orbit-reverse-card">
++      <div class="d-flex align-items-center gap-3 flex-wrap">
++        <div class="me-auto">
++          <h2 class="mb-1">{{ $t('pin.duvo_rev_title') }}</h2>
++          <p class="text-secondary mb-0">{{ $t('pin.duvo_rev_sub') }}</p>
++        </div>
++        <button class="btn btn-primary" type="button" @click="rev.adding = !rev.adding">{{ rev.adding ? $t('pin.duvo_rev_close_add') : $t('pin.duvo_rev_add') }}</button>
+       </div>
+-      <p v-if="!rev.devices.length" class="text-secondary">{{ $t('pin.orbit_rev_none') }}</p>
+-      <ul class="list-group mb-3" v-if="rev.devices.length">
+-        <li v-for="d in rev.devices" class="list-group-item d-flex align-items-center">
+-          <span class="flex-grow-1">{{ d.model || d.serial }} <small class="text-secondary">{{ d.serial }}</small>
+-            <small v-if="d.state === 'unauthorized'" class="text-danger d-block">{{ $t('pin.orbit_rev_unauthorized') }}</small>
+-          </span>
+-          <button v-if="d.state === 'device' && !rev.running.includes(d.serial)" class="btn btn-sm btn-primary" type="button" @click="revStart(d.serial)">{{ $t('pin.orbit_rev_open') }}</button>
+-          <button v-if="rev.running.includes(d.serial)" class="btn btn-sm btn-outline-danger" type="button" @click="revStop(d.serial)">{{ $t('pin.orbit_rev_close') }}</button>
+-        </li>
+-      </ul>
+-      <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-audio" v-model="rev.audio"><label class="form-check-label" for="rev-audio">{{ $t('pin.orbit_rev_audio') }}</label></div>
+-      <div class="form-check mb-3"><input class="form-check-input" type="checkbox" id="rev-off" v-model="rev.screenOff"><label class="form-check-label" for="rev-off">{{ $t('pin.orbit_rev_screen_off') }}</label></div>
+-      <h3 class="h6">{{ $t('pin.orbit_rev_pair_title') }}</h3>
+-      <p class="text-secondary small">{{ $t('pin.orbit_rev_pair_hint') }}</p>
+-      <div class="input-group mb-3">
+-        <input class="form-control" v-model="rev.pairAddr" :placeholder="$t('pin.orbit_rev_addr')">
+-        <input class="form-control" v-model="rev.pairCode" :placeholder="$t('pin.orbit_rev_code')" maxlength="6">
+-        <button class="btn btn-outline-primary" type="button" @click="revPair">{{ $t('pin.orbit_rev_pair') }}</button>
++
++      <div v-if="rev.error" class="alert alert-danger duvo-rev-error">
++        <strong>{{ rev.error.title }}</strong>
++        <div style="white-space: pre-wrap">{{ rev.error.text }}</div>
++      </div>
++
++      <div v-if="!rev.devices.length && !rev.error" class="duvo-rev-empty text-secondary">{{ $t('pin.duvo_rev_none') }}</div>
++      <div v-for="d in rev.devices" :key="d.serial" class="duvo-device duvo-rev-row">
++        <div class="duvo-device-icon"><i class="fas fa-mobile-screen"></i></div>
++        <div class="duvo-device-name">
++          <strong>{{ d.model || d.serial }}</strong>
++          <small :class="d.state === 'device' ? (rev.running.includes(d.serial) ? 'text-success' : 'text-secondary') : 'text-warning'">{{ revStateText(d) }}</small>
++        </div>
++        <div class="duvo-device-actions">
++          <button v-if="d.state === 'device' && !rev.running.includes(d.serial)" class="btn btn-primary" type="button" @click="revStart(d.serial)">{{ $t('pin.duvo_rev_open') }}</button>
++          <button v-if="rev.running.includes(d.serial)" class="btn btn-outline-secondary" type="button" @click="revRotate(d.serial)"><i class="fas fa-rotate-right"></i> {{ $t('pin.duvo_rev_rotate') }}</button>
++          <button v-if="rev.running.includes(d.serial)" class="btn btn-outline-danger" type="button" @click="revStop(d.serial)">{{ $t('pin.duvo_rev_close') }}</button>
++          <button class="btn btn-outline-secondary" type="button" :title="$t('pin.duvo_rev_remove')" @click="revRemove(d.serial)"><i class="fas fa-trash"></i></button>
++        </div>
+       </div>
+-      <h3 class="h6">{{ $t('pin.orbit_rev_connect_title') }}</h3>
+-      <p class="text-secondary small">{{ $t('pin.orbit_rev_connect_hint') }}</p>
+-      <div class="input-group">
+-        <input class="form-control" v-model="rev.connectAddr" :placeholder="$t('pin.orbit_rev_addr')">
+-        <button class="btn btn-outline-primary" type="button" @click="revConnect">{{ $t('pin.orbit_rev_connect') }}</button>
++      <div class="d-flex gap-4 flex-wrap mt-2" v-if="rev.devices.length">
++        <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-audio" v-model="rev.audio"><label class="form-check-label" for="rev-audio">{{ $t('pin.duvo_rev_audio') }}</label></div>
++        <div class="form-check"><input class="form-check-input" type="checkbox" id="rev-off" v-model="rev.screenOff"><label class="form-check-label" for="rev-off">{{ $t('pin.duvo_rev_screen_off') }}</label></div>
++      </div>
++
++      <div v-if="rev.adding" class="duvo-rev-add">
++        <p class="text-secondary mb-3">{{ $t('pin.duvo_rev_add_intro') }}</p>
++        <div class="duvo-rev-step">
++          <h3 class="h6">{{ $t('pin.duvo_rev_step1') }}</h3>
++          <p class="text-secondary small">{{ $t('pin.duvo_rev_step1_hint') }}</p>
++          <div class="input-group">
++            <input class="form-control" v-model="rev.pairAddr" :placeholder="$t('pin.duvo_rev_addr')">
++            <input class="form-control" v-model="rev.pairCode" :placeholder="$t('pin.duvo_rev_code')" maxlength="6" inputmode="numeric">
++            <button class="btn btn-outline-primary" type="button" :disabled="rev.busy" @click="revPair">{{ $t('pin.duvo_rev_pair') }}</button>
++          </div>
++        </div>
++        <div class="duvo-rev-step">
++          <h3 class="h6">{{ $t('pin.duvo_rev_step2') }}</h3>
++          <p class="text-secondary small">{{ $t('pin.duvo_rev_step2_hint') }}</p>
++          <div class="input-group">
++            <input class="form-control" v-model="rev.connectAddr" :placeholder="$t('pin.duvo_rev_addr')">
++            <button class="btn btn-primary" type="button" :disabled="rev.busy" @click="revConnect">{{ $t('pin.duvo_rev_connect') }}</button>
++          </div>
++        </div>
++        <div v-if="rev.ok" class="alert alert-success mt-3 mb-0">{{ rev.ok }}</div>
+       </div>
+     </div>
+     <details class="duvo-advanced card p-3 mb-4">
+@@ -454,7 +474,7 @@
+       editingHost: false,
+       currentTab: location.hash || '#OTP',
+       orbitUri: '',
+-      rev: { tools: null, devices: [], running: [], msg: '', audio: true, screenOff: false, pairAddr: '', pairCode: '', connectAddr: '' },
++      rev: { tools: null, devices: [], running: [], error: null, ok: '', busy: false, adding: false, audio: true, screenOff: false, pairAddr: '', pairCode: '', connectAddr: '' },
+       orbitRemaining: 0,
+       orbitError: '',
+       otp: '',
+@@ -503,6 +523,7 @@
+       this.revRefresh();
+       this.generateOrbitQR();
+       setInterval(() => { if (!currentEditingClient) this.refreshClients(); }, 4000);
++      setInterval(() => this.revRefresh(), 4000);
+     },
+     methods: {
+       switchTab(currentTab) {
+@@ -562,28 +583,72 @@
+           body: JSON.stringify(body || {})
+         }).then(r => r.json());
+       },
++      revStateText(d) {
++        if (d.state === 'unauthorized') return this.$t('pin.duvo_rev_st_unauthorized');
++        if (d.state === 'offline') return this.$t('pin.duvo_rev_st_offline');
++        if (d.state !== 'device') return d.state;
++        return this.rev.running.includes(d.serial) ? this.$t('pin.duvo_rev_st_open') : this.$t('pin.duvo_rev_st_ready');
++      },
++      // Turns what adb printed into a plain explanation of what to do.
++      revExplain(out) {
++        const t = String(out || '').toLowerCase();
++        const k = (x) => this.$t('pin.duvo_rev_err_' + x);
++        if (t.includes('adb not found')) return k('no_adb');
++        if (t.includes('timeout')) return k('timeout');
++        if (t.includes('invalid')) return k('invalid');
++        if (t.includes('failed to authenticate') || t.includes('wrong') || t.includes('incorrect') || t.includes('pairing code')) return k('code');
++        if (t.includes('refused') || t.includes('recusou') || t.includes('10061')) return k('refused');
++        if (t.includes('unauthorized')) return k('unauthorized');
++        if (t.includes('cannot connect') || t.includes('unable to connect') || t.includes('no route') || t.includes('10060') || t.includes('failed to connect')) return k('unreachable');
++        if (t.includes('no devices') || t.includes('not found')) return k('gone');
++        return k('other') + (out ? '\n' + String(out).trim().slice(0, 300) : '');
++      },
++      revFail(title, out) { this.rev.error = { title: this.$t('pin.duvo_rev_err_' + title), text: this.revExplain(out) }; },
+       revRefresh() {
+         return this.revPost('devices').then(r => {
+           this.rev.tools = r.tools; this.rev.devices = r.devices || []; this.rev.running = r.running || [];
+-        }).catch(() => {});
++          if (r.tools && !r.tools.adb) this.rev.error = { title: this.$t('pin.duvo_rev_err_t_adb'), text: this.$t('pin.duvo_rev_err_no_adb') };
++          else if (r.tools && !r.tools.scrcpy) this.rev.error = { title: this.$t('pin.duvo_rev_err_t_scrcpy'), text: this.$t('pin.duvo_rev_err_no_scrcpy') };
++          else if (r.adb_error) this.revFail('t_adbfail', r.adb_error);
++          else if (this.rev.error && this.rev.error.auto) this.rev.error = null;
++          const bad = (r.devices || []).find(d => d.state === 'unauthorized');
++          if (bad && !this.rev.error) this.rev.error = { title: this.$t('pin.duvo_rev_err_t_unauth'), text: this.$t('pin.duvo_rev_err_unauthorized'), auto: true };
++        }).catch(() => { this.rev.error = { title: this.$t('pin.duvo_rev_err_t_panel'), text: this.$t('pin.duvo_rev_err_panel') }; });
+       },
+       revPair() {
+-        this.rev.msg = '';
+-        this.revPost('pair', { hostport: this.rev.pairAddr.trim(), code: this.rev.pairCode.trim() })
+-          .then(r => { this.rev.msg = (r.ok ? '' : this.$t('pin.orbit_rev_failed') + ': ') + (r.output || ''); this.revRefresh(); });
++        this.rev.error = null; this.rev.ok = ''; this.rev.busy = true;
++        this.revPost('pair', { hostport: this.rev.pairAddr.trim(), code: this.rev.pairCode.trim() }).then(r => {
++          if (r.ok) { this.rev.ok = this.$t('pin.duvo_rev_paired'); this.rev.pairCode = ''; } else { this.revFail('t_pair', r.output); }
++          this.revRefresh();
++        }).finally(() => { this.rev.busy = false; });
+       },
+       revConnect() {
+-        this.rev.msg = '';
+-        this.revPost('connect', { hostport: this.rev.connectAddr.trim() })
+-          .then(r => { this.rev.msg = (r.ok ? '' : this.$t('pin.orbit_rev_failed') + ': ') + (r.output || ''); this.revRefresh(); });
++        this.rev.error = null; this.rev.ok = ''; this.rev.busy = true;
++        this.revPost('connect', { hostport: this.rev.connectAddr.trim() }).then(r => {
++          const out = String(r.output || '').toLowerCase();
++          if (r.ok && !out.includes('cannot') && !out.includes('failed')) { this.rev.ok = this.$t('pin.duvo_rev_connected'); this.rev.adding = false; } else { this.revFail('t_connect', r.output); }
++          this.revRefresh();
++        }).finally(() => { this.rev.busy = false; });
+       },
+       revStart(serial) {
+-        this.rev.msg = '';
+-        this.revPost('start', { serial, audio: this.rev.audio, turn_screen_off: this.rev.screenOff })
+-          .then(r => { if (!r.ok) this.rev.msg = this.$t('pin.orbit_rev_failed') + ': ' + (r.error || ''); this.revRefresh(); });
++        this.rev.error = null;
++        this.revPost('start', { serial, audio: this.rev.audio, turn_screen_off: this.rev.screenOff }).then(r => {
++          if (!r.ok && r.error === 'scrcpy_missing') { this.rev.error = { title: this.$t('pin.duvo_rev_err_t_scrcpy'), text: this.$t('pin.duvo_rev_err_no_scrcpy') }; }
++          else if (!r.ok && r.error !== 'already_running') { this.rev.error = { title: this.$t('pin.duvo_rev_err_t_open'), text: this.$t('pin.duvo_rev_err_open') + (r.error ? '\n' + r.error : '') }; }
++          this.revRefresh().then(() => setTimeout(() => this.revRefresh().then(() => {
++            // The window closed on its own right after opening: usually the phone refused the capture.
++            if (r.ok && !this.rev.running.includes(serial) && !this.rev.error) this.rev.error = { title: this.$t('pin.duvo_rev_err_t_closed'), text: this.$t('pin.duvo_rev_err_closed') };
++          }), 4500));
++        });
++      },
++      revStop(serial) { this.revPost('stop', { serial }).then(() => this.revRefresh()); },
++      revRotate(serial) {
++        this.rev.error = null;
++        this.revPost('rotate', { serial }).then(r => { if (!r.ok) this.revFail('t_rotate', r.output); });
+       },
+-      revStop(serial) {
+-        this.revPost('stop', { serial }).then(() => this.revRefresh());
++      revRemove(serial) {
++        this.rev.error = null;
++        this.revPost('disconnect', { serial }).then(() => this.revRefresh());
+       },
+       generateOrbitQR() {
+         this.orbitError = '';
+diff --git a/src_assets/common/assets/web/public/assets/css/duvo.css b/src_assets/common/assets/web/public/assets/css/duvo.css
+index 3532b003..cb9f9b2d 100644
+--- a/src_assets/common/assets/web/public/assets/css/duvo.css
++++ b/src_assets/common/assets/web/public/assets/css/duvo.css
+@@ -154,3 +154,11 @@ html .duvo-segmented { display: flex; gap: 4px; padding: 4px; border-radius: 14p
+ html .duvo-segmented button, html .duvo-segmented span { height: 36px; padding: 0 12px; border-radius: 10px; border: none; background: transparent; color: var(--bs-secondary-color); font-size: 13px; display: inline-flex; align-items: center; }
+ html .duvo-segmented .on { background: #f2851f; color: #1a1204; font-weight: 600; }
+ html .duvo-device-actions { display: flex; gap: 6px; }
++
++/* Phone on PC card */
++html .duvo-rev { padding: 24px; margin-bottom: 20px; }
++html .duvo-rev-row { padding: 14px 4px; border-top: 1px solid var(--bs-border-color); }
++html .duvo-rev-empty { padding: 18px 0 4px; }
++html .duvo-rev-error { margin-top: 16px; margin-bottom: 0; }
++html .duvo-rev-add { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--bs-border-color); }
++html .duvo-rev-step { margin-bottom: 18px; }
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index 98483e16..54c05ca3 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -600,7 +600,56 @@
+     "duvo_paired": "Paired",
+     "duvo_disconnect": "Disconnect",
+     "duvo_advanced_edit": "Advanced permissions and name",
+-    "duvo_remove": "Remove device"
++    "duvo_remove": "Remove device",
++    "duvo_rev_title": "Phone on this PC",
++    "duvo_rev_sub": "See the phone screen in a window here and control it with the mouse and keyboard.",
++    "duvo_rev_add": "Add phone",
++    "duvo_rev_close_add": "Close",
++    "duvo_rev_none": "No phone connected yet. Click \"Add phone\".",
++    "duvo_rev_open": "Open",
++    "duvo_rev_close": "Close",
++    "duvo_rev_rotate": "Rotate",
++    "duvo_rev_remove": "Remove this phone",
++    "duvo_rev_audio": "Som do celular no PC",
++    "duvo_rev_screen_off": "Apagar a tela do celular",
++    "duvo_rev_add_intro": "No celular: Opções do desenvolvedor > Depuração sem fio. Celular e PC precisam estar na mesma rede Wi-Fi.",
++    "duvo_rev_step1": "1. Parear (só na primeira vez)",
++    "duvo_rev_step1_hint": "Na Depuração sem fio, toque em \"Parear dispositivo com código\" e digite aqui o endereço e o código mostrados.",
++    "duvo_rev_step2": "2. Conectar",
++    "duvo_rev_step2_hint": "Use o endereço que aparece na tela principal da Depuração sem fio (a porta é diferente da do pareamento).",
++    "duvo_rev_addr": "Endereço (ex.: 192.168.0.12:37000)",
++    "duvo_rev_code": "Código de 6 dígitos",
++    "duvo_rev_pair": "Pair",
++    "duvo_rev_connect": "Connect",
++    "duvo_rev_paired": "Celular pareado. Agora faça o passo 2 para conectar.",
++    "duvo_rev_connected": "Celular conectado.",
++    "duvo_rev_st_ready": "Pronto para abrir",
++    "duvo_rev_st_open": "Janela aberta",
++    "duvo_rev_st_unauthorized": "Aguardando você permitir no celular",
++    "duvo_rev_st_offline": "Sem resposta (offline)",
++    "duvo_rev_err_t_adb": "O adb não foi encontrado",
++    "duvo_rev_err_no_adb": "O programa adb não está na pasta \"tools\" ao lado do Duvo nem no PATH do Windows. Instale as ferramentas do Android (platform-tools) ou reinstale o Duvo.",
++    "duvo_rev_err_t_scrcpy": "O scrcpy não foi encontrado",
++    "duvo_rev_err_no_scrcpy": "O programa scrcpy (que mostra a tela do celular) não está na pasta \"tools\" ao lado do Duvo nem no PATH. Sem ele não dá para abrir a janela do celular.",
++    "duvo_rev_err_t_adbfail": "O adb não conseguiu iniciar",
++    "duvo_rev_err_t_panel": "O painel perdeu a conexão com o Duvo",
++    "duvo_rev_err_panel": "Não consegui falar com o Duvo neste PC. Ele pode ter sido fechado; abra o atalho Duvo de novo.",
++    "duvo_rev_err_t_pair": "Não foi possível parear",
++    "duvo_rev_err_t_connect": "Não foi possível conectar",
++    "duvo_rev_err_t_rotate": "Não foi possível girar a tela",
++    "duvo_rev_err_t_open": "Não foi possível abrir a janela do celular",
++    "duvo_rev_err_open": "O scrcpy não iniciou. Confira se o celular continua na lista e desbloqueado.",
++    "duvo_rev_err_t_closed": "A janela do celular fechou logo ao abrir",
++    "duvo_rev_err_closed": "Isso acontece quando o celular recusa a captura de tela. Deixe o celular desbloqueado e, em Xiaomi/Poco, ative em Opções do desenvolvedor a \"Depuração USB (configurações de segurança)\". Se continuar, remova o celular e conecte de novo.",
++    "duvo_rev_err_t_unauth": "O celular está esperando sua permissão",
++    "duvo_rev_err_unauthorized": "Olhe a tela do celular e toque em \"Permitir\" no aviso \"Permitir depuração por Wi-Fi?\". Marque \"Sempre permitir neste computador\".",
++    "duvo_rev_err_timeout": "O celular não respondeu a tempo. Ele pode estar bloqueado, com a tela desligada ou em outra rede Wi-Fi. Desbloqueie, deixe a tela de Depuração sem fio aberta e tente de novo.",
++    "duvo_rev_err_invalid": "O endereço ou o código está num formato inválido. Use IP e porta, como 192.168.0.12:37000, e o código de 6 números.",
++    "duvo_rev_err_code": "O código de pareamento está errado ou expirou. Ele muda cada vez que você abre \"Parear dispositivo com código\". Veja o código na tela do celular e tente de novo.",
++    "duvo_rev_err_refused": "O celular recusou a conexão. Confira se a Depuração sem fio está ligada e se o endereço e a porta são exatamente os da tela dele. A porta muda toda vez que a depuração é religada.",
++    "duvo_rev_err_unreachable": "Não consegui alcançar o celular. PC e celular precisam estar na mesma rede Wi-Fi (não use a rede de convidados) e o celular precisa estar com a tela ligada.",
++    "duvo_rev_err_gone": "O celular não está mais conectado. Remova-o da lista e conecte de novo.",
++    "duvo_rev_err_other": "Aconteceu um erro que não reconheço. O adb respondeu:"
+   },
+   "resource_card": {
+     "github_discussions": "GitHub Discussions",
+diff --git a/src_assets/common/assets/web/public/assets/locale/pt_BR.json b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+index 10b90daa..511c1ad2 100644
+--- a/src_assets/common/assets/web/public/assets/locale/pt_BR.json
++++ b/src_assets/common/assets/web/public/assets/locale/pt_BR.json
+@@ -554,7 +554,56 @@
+     "duvo_paired": "Pareado",
+     "duvo_disconnect": "Desconectar",
+     "duvo_advanced_edit": "Permissões avançadas e nome",
+-    "duvo_remove": "Remover aparelho"
++    "duvo_remove": "Remover aparelho",
++    "duvo_rev_title": "Celular no PC",
++    "duvo_rev_sub": "Veja a tela do celular numa janela aqui e controle com o mouse e o teclado.",
++    "duvo_rev_add": "Adicionar celular",
++    "duvo_rev_close_add": "Fechar",
++    "duvo_rev_none": "Nenhum celular conectado ainda. Toque em \"Adicionar celular\".",
++    "duvo_rev_open": "Abrir",
++    "duvo_rev_close": "Fechar",
++    "duvo_rev_rotate": "Girar tela",
++    "duvo_rev_remove": "Remover este celular",
++    "duvo_rev_audio": "Som do celular no PC",
++    "duvo_rev_screen_off": "Apagar a tela do celular",
++    "duvo_rev_add_intro": "No celular: Opções do desenvolvedor > Depuração sem fio. Celular e PC precisam estar na mesma rede Wi-Fi.",
++    "duvo_rev_step1": "1. Parear (só na primeira vez)",
++    "duvo_rev_step1_hint": "Na Depuração sem fio, toque em \"Parear dispositivo com código\" e digite aqui o endereço e o código mostrados.",
++    "duvo_rev_step2": "2. Conectar",
++    "duvo_rev_step2_hint": "Use o endereço que aparece na tela principal da Depuração sem fio (a porta é diferente da do pareamento).",
++    "duvo_rev_addr": "Endereço (ex.: 192.168.0.12:37000)",
++    "duvo_rev_code": "Código de 6 dígitos",
++    "duvo_rev_pair": "Parear",
++    "duvo_rev_connect": "Conectar",
++    "duvo_rev_paired": "Celular pareado. Agora faça o passo 2 para conectar.",
++    "duvo_rev_connected": "Celular conectado.",
++    "duvo_rev_st_ready": "Pronto para abrir",
++    "duvo_rev_st_open": "Janela aberta",
++    "duvo_rev_st_unauthorized": "Aguardando você permitir no celular",
++    "duvo_rev_st_offline": "Sem resposta (offline)",
++    "duvo_rev_err_t_adb": "O adb não foi encontrado",
++    "duvo_rev_err_no_adb": "O programa adb não está na pasta \"tools\" ao lado do Duvo nem no PATH do Windows. Instale as ferramentas do Android (platform-tools) ou reinstale o Duvo.",
++    "duvo_rev_err_t_scrcpy": "O scrcpy não foi encontrado",
++    "duvo_rev_err_no_scrcpy": "O programa scrcpy (que mostra a tela do celular) não está na pasta \"tools\" ao lado do Duvo nem no PATH. Sem ele não dá para abrir a janela do celular.",
++    "duvo_rev_err_t_adbfail": "O adb não conseguiu iniciar",
++    "duvo_rev_err_t_panel": "O painel perdeu a conexão com o Duvo",
++    "duvo_rev_err_panel": "Não consegui falar com o Duvo neste PC. Ele pode ter sido fechado; abra o atalho Duvo de novo.",
++    "duvo_rev_err_t_pair": "Não foi possível parear",
++    "duvo_rev_err_t_connect": "Não foi possível conectar",
++    "duvo_rev_err_t_rotate": "Não foi possível girar a tela",
++    "duvo_rev_err_t_open": "Não foi possível abrir a janela do celular",
++    "duvo_rev_err_open": "O scrcpy não iniciou. Confira se o celular continua na lista e desbloqueado.",
++    "duvo_rev_err_t_closed": "A janela do celular fechou logo ao abrir",
++    "duvo_rev_err_closed": "Isso acontece quando o celular recusa a captura de tela. Deixe o celular desbloqueado e, em Xiaomi/Poco, ative em Opções do desenvolvedor a \"Depuração USB (configurações de segurança)\". Se continuar, remova o celular e conecte de novo.",
++    "duvo_rev_err_t_unauth": "O celular está esperando sua permissão",
++    "duvo_rev_err_unauthorized": "Olhe a tela do celular e toque em \"Permitir\" no aviso \"Permitir depuração por Wi-Fi?\". Marque \"Sempre permitir neste computador\".",
++    "duvo_rev_err_timeout": "O celular não respondeu a tempo. Ele pode estar bloqueado, com a tela desligada ou em outra rede Wi-Fi. Desbloqueie, deixe a tela de Depuração sem fio aberta e tente de novo.",
++    "duvo_rev_err_invalid": "O endereço ou o código está num formato inválido. Use IP e porta, como 192.168.0.12:37000, e o código de 6 números.",
++    "duvo_rev_err_code": "O código de pareamento está errado ou expirou. Ele muda cada vez que você abre \"Parear dispositivo com código\". Veja o código na tela do celular e tente de novo.",
++    "duvo_rev_err_refused": "O celular recusou a conexão. Confira se a Depuração sem fio está ligada e se o endereço e a porta são exatamente os da tela dele. A porta muda toda vez que a depuração é religada.",
++    "duvo_rev_err_unreachable": "Não consegui alcançar o celular. PC e celular precisam estar na mesma rede Wi-Fi (não use a rede de convidados) e o celular precisa estar com a tela ligada.",
++    "duvo_rev_err_gone": "O celular não está mais conectado. Remova-o da lista e conecte de novo.",
++    "duvo_rev_err_other": "Aconteceu um erro que não reconheço. O adb respondeu:"
+   },
+   "resource_card": {
+     "github_discussions": "Discussões no GitHub",
+diff --git a/tests/unit/test_orbit_reverse.cpp b/tests/unit/test_orbit_reverse.cpp
+index 489c0bca..a538b9ad 100644
+--- a/tests/unit/test_orbit_reverse.cpp
++++ b/tests/unit/test_orbit_reverse.cpp
+@@ -66,7 +66,7 @@ TEST(OrbitReverse, BuildsScrcpyArgsWithinRanges) {
+ 
+ TEST(OrbitReverse, QuotesCommandLine) {
+   EXPECT_EQ(quote_command("C:\\a b\\scrcpy.exe", {"-s", "x"}), "\"C:\\a b\\scrcpy.exe\" -s x");
+-  EXPECT_EQ(quote_command("a", {"--window-title=Orbit - celular"}), "a \"--window-title=Orbit - celular\"");
++  EXPECT_EQ(quote_command("a", {"--window-title=Duvo - celular"}), "a \"--window-title=Duvo - celular\"");
+   EXPECT_EQ(quote_command("a", {"say \"hi\""}), "a \"say \\\"hi\\\"\"");
+   EXPECT_EQ(quote_command("a", {"c:\\dir with space\\"}), "a \"c:\\dir with space\\\\\"");
+ }
+-- 
+2.55.0.windows.5
+

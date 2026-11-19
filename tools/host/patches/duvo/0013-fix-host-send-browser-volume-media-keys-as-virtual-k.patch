@@ -1,0 +1,32 @@
+From a50e2269d870a00d0865f0d055e1e2cb2dfa540f Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:35:05 -0300
+Subject: [PATCH 13/28] fix(host): send browser/volume/media keys as virtual
+ keys, not scan codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/platform/windows/input.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/platform/windows/input.cpp b/src/platform/windows/input.cpp
+index 9de9adb0..28a3a138 100644
+--- a/src/platform/windows/input.cpp
++++ b/src/platform/windows/input.cpp
+@@ -622,6 +622,13 @@ namespace platf {
+       ki.wScan = MapVirtualKey(modcode, MAPVK_VK_TO_VSC);
+     }
+ 
++    // ORBIT: browser/volume/media/launch keys (VK 0xA6..0xB7) have no plain scan code: their scan codes
++    // are extended (E0 xx) and without the prefix Windows read them as letters (volume-down -> 'c').
++    // Always send these as virtual keys.
++    if (modcode >= VK_BROWSER_BACK && modcode <= VK_LAUNCH_APP2) {
++      ki.wScan = 0;
++    }
++
+     // If we can map this to a scancode, send it as a scancode for maximum game compatibility.
+     if (ki.wScan) {
+       ki.dwFlags = KEYEVENTF_SCANCODE;
+-- 
+2.55.0.windows.5
+

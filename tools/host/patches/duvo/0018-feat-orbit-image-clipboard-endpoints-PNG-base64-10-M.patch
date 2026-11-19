@@ -1,0 +1,625 @@
+From 2add598aaa1377603ffcd058cfbaeb12859827cf Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:39:16 -0300
+Subject: [PATCH 18/28] feat(orbit): image clipboard endpoints (PNG base64, 10
+ MB limit)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake  |   2 +
+ cmake/compile_definitions/windows.cmake |   2 +
+ src/orbit/api_routes.h                  |  21 +++
+ src/orbit/clipboard_image.cpp           | 100 ++++++++++
+ src/orbit/clipboard_image.h             |  56 ++++++
+ src/orbit/clipboard_image_win.cpp       | 236 ++++++++++++++++++++++++
+ tests/unit/test_clipboard_image.cpp     | 106 +++++++++++
+ 7 files changed, 523 insertions(+)
+ create mode 100644 src/orbit/clipboard_image.cpp
+ create mode 100644 src/orbit/clipboard_image.h
+ create mode 100644 src/orbit/clipboard_image_win.cpp
+ create mode 100644 tests/unit/test_clipboard_image.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 0950b9b9..7c7c7887 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -127,6 +127,8 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/power_api.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/win_actions.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/win_actions.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/clipboard_image.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/clipboard_image.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/cmake/compile_definitions/windows.cmake b/cmake/compile_definitions/windows.cmake
+index e38c7dc4..a93166db 100644
+--- a/cmake/compile_definitions/windows.cmake
++++ b/cmake/compile_definitions/windows.cmake
+@@ -65,6 +65,7 @@ set(PLATFORM_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/platform_status_win.cpp"  # ORBIT: status source (foreground window, volume, SMTC)
+         "${CMAKE_SOURCE_DIR}/src/orbit/platform_windows_win.cpp"  # ORBIT: windows/apps/desktop/volume/power
++        "${CMAKE_SOURCE_DIR}/src/orbit/clipboard_image_win.cpp"  # ORBIT: image clipboard
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda-ioctl.h"
+         "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda.h"
+         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
+@@ -84,6 +85,7 @@ list(PREPEND PLATFORM_LIBRARIES
+         d3d11
+         D3DCompiler
+         dwmapi
++        windowscodecs  # ORBIT: WIC for the image clipboard
+         dxgi
+         iphlpapi
+         ksuser
+diff --git a/src/orbit/api_routes.h b/src/orbit/api_routes.h
+index 4b3043c1..63a19bbf 100644
+--- a/src/orbit/api_routes.h
++++ b/src/orbit/api_routes.h
+@@ -22,6 +22,7 @@
+ #pragma once
+ 
+ #include "api_reply.h"
++#include "clipboard_image.h"
+ #include "power_api.h"
+ #include "src/crypto.h"
+ #include "status_tracker.h"
+@@ -57,6 +58,7 @@ namespace orbit {
+     std::shared_ptr<StatusTracker> tracker;
+     std::shared_ptr<WindowPlatform> windows;
+     std::shared_ptr<PowerPlatform> power;
++    std::shared_ptr<ClipboardImagePlatform> clipboard;
+ 
+     ~ApiHandle() {
+       if (tracker) {
+@@ -161,6 +163,25 @@ namespace orbit {
+       detail::write_reply(response, power_reply(detail::cert_of(request), *power, detail::query_of(request)));
+     };
+ 
++    handle->clipboard = make_platform_clipboard_image();
++    auto clipboard = handle->clipboard;
++    server.resource["^/orbit/clipboard$"]["GET"] = [clipboard](auto response, auto request) {
++      auto q = detail::query_of(request);
++      if (q["type"] != "image") {
++        detail::write_reply(response, error_reply(400, "unsupported_type"));
++        return;
++      }
++      detail::write_reply(response, clipboard_image_get_reply(detail::cert_of(request), *clipboard));
++    };
++    server.resource["^/orbit/clipboard$"]["POST"] = [clipboard](auto response, auto request) {
++      auto q = detail::query_of(request);
++      if (q["type"] != "image") {
++        detail::write_reply(response, error_reply(400, "unsupported_type"));
++        return;
++      }
++      detail::write_reply(response, clipboard_image_set_reply(detail::cert_of(request), *clipboard, request->content.string()));
++    };
++
+     return handle;
+   }
+ }  // namespace orbit
+diff --git a/src/orbit/clipboard_image.cpp b/src/orbit/clipboard_image.cpp
+new file mode 100644
+index 00000000..685eaa61
+--- /dev/null
++++ b/src/orbit/clipboard_image.cpp
+@@ -0,0 +1,100 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/clipboard_image.cpp
++ * @brief Image clipboard endpoints (platform independent part).
++ */
++#include "clipboard_image.h"
++
++#include <nlohmann/json.hpp>
++#include <openssl/evp.h>
++
++namespace orbit {
++  std::string base64_encode(const std::vector<unsigned char> &data) {
++    if (data.empty()) {
++      return {};
++    }
++    std::string out(4 * ((data.size() + 2) / 3), '\0');
++    int n = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(out.data()), data.data(), static_cast<int>(data.size()));
++    out.resize(n < 0 ? 0 : static_cast<std::size_t>(n));
++    return out;
++  }
++
++  std::optional<std::vector<unsigned char>> base64_decode(const std::string &text) {
++    std::string s;
++    s.reserve(text.size());
++    for (char c : text) {
++      if (c != '\r' && c != '\n' && c != ' ') {
++        s.push_back(c);
++      }
++    }
++    if (s.size() % 4 != 0) {
++      return std::nullopt;
++    }
++    if (s.empty()) {
++      return std::vector<unsigned char> {};
++    }
++    std::vector<unsigned char> out(s.size() / 4 * 3);
++    int n = EVP_DecodeBlock(out.data(), reinterpret_cast<const unsigned char *>(s.data()), static_cast<int>(s.size()));
++    if (n < 0) {
++      return std::nullopt;
++    }
++    std::size_t pad = (s.size() >= 1 && s.back() == '=') + (s.size() >= 2 && s[s.size() - 2] == '=');
++    out.resize(static_cast<std::size_t>(n) - pad);
++    return out;
++  }
++
++  ApiReply clipboard_image_get_reply(const crypto::named_cert_t *cert, ClipboardImagePlatform &p) {
++    if (int e = perm_error(cert, crypto::PERM::clipboard_read)) {
++      return {e, {}};
++    }
++    auto png = p.get_png();
++    if (!png || png->empty()) {
++      return {204, {}};
++    }
++    if (png->size() > kMaxClipboardImageBytes) {
++      return error_reply(413, "too_large");
++    }
++    return {200, nlohmann::json {{"png", base64_encode(*png)}}.dump()};
++  }
++
++  ApiReply clipboard_image_set_reply(const crypto::named_cert_t *cert, ClipboardImagePlatform &p, const std::string &body) {
++    if (int e = perm_error(cert, crypto::PERM::clipboard_set)) {
++      return {e, {}};
++    }
++    // Reject absurd bodies before parsing (base64 of 10 MB is ~13.4 MB).
++    if (body.size() > kMaxClipboardImageBytes / 3 * 4 + 4096) {
++      return error_reply(413, "too_large");
++    }
++    auto j = nlohmann::json::parse(body, nullptr, false);
++    if (j.is_discarded() || !j.is_object() || !j.contains("png") || !j["png"].is_string()) {
++      return error_reply(400, "bad_body");
++    }
++    auto png = base64_decode(j["png"].get<std::string>());
++    if (!png || png->empty()) {
++      return error_reply(400, "bad_png");
++    }
++    if (png->size() > kMaxClipboardImageBytes) {
++      return error_reply(413, "too_large");
++    }
++    if (!p.set_png(*png)) {
++      return error_reply(500, "clipboard_failed");
++    }
++    return {200, R"({"ok":true})"};
++  }
++}  // namespace orbit
+diff --git a/src/orbit/clipboard_image.h b/src/orbit/clipboard_image.h
+new file mode 100644
+index 00000000..d5ab15a9
+--- /dev/null
++++ b/src/orbit/clipboard_image.h
+@@ -0,0 +1,56 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/clipboard_image.h
++ * @brief Image clipboard endpoints (/orbit/clipboard?type=image), PNG base64 in JSON.
++ */
++#pragma once
++
++#include "api_reply.h"
++
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace orbit {
++  /// Decoded PNG size limit (spec: 10 MB).
++  inline constexpr std::size_t kMaxClipboardImageBytes = 10u * 1024u * 1024u;
++
++  /// Windows clipboard access for images (PNG bytes). Fakes in tests.
++  class ClipboardImagePlatform {
++  public:
++    virtual ~ClipboardImagePlatform() = default;
++    /// PNG of the current clipboard image, or nullopt when the clipboard has no image.
++    virtual std::optional<std::vector<unsigned char>> get_png() = 0;
++    /// Put a PNG on the clipboard (as PNG and as a bitmap). False on failure.
++    virtual bool set_png(const std::vector<unsigned char> &png) = 0;
++  };
++
++  std::string base64_encode(const std::vector<unsigned char> &data);
++  /// nullopt for invalid base64.
++  std::optional<std::vector<unsigned char>> base64_decode(const std::string &text);
++
++  /// GET: 401/403 (clipboard_read), 204 without image, 413 if larger than the limit, 200 {"png": base64}.
++  ApiReply clipboard_image_get_reply(const crypto::named_cert_t *cert, ClipboardImagePlatform &p);
++  /// POST body {"png": base64}: 401/403 (clipboard_set), 400 bad body, 413 over the limit, 500 on failure, 200.
++  ApiReply clipboard_image_set_reply(const crypto::named_cert_t *cert, ClipboardImagePlatform &p, const std::string &body);
++
++  std::shared_ptr<ClipboardImagePlatform> make_platform_clipboard_image();
++}  // namespace orbit
+diff --git a/src/orbit/clipboard_image_win.cpp b/src/orbit/clipboard_image_win.cpp
+new file mode 100644
+index 00000000..ada7e7bb
+--- /dev/null
++++ b/src/orbit/clipboard_image_win.cpp
+@@ -0,0 +1,236 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/clipboard_image_win.cpp
++ * @brief Windows image clipboard: reads the registered "PNG" format or a bitmap (encoded with WIC); writes PNG + CF_DIB.
++ */
++// clang-format off
++#include <windows.h>
++#include <objidl.h>
++#include <wincodec.h>
++// clang-format on
++
++#include "clipboard_image.h"
++
++#include <cstring>
++#include <thread>
++
++namespace orbit {
++  namespace {
++    template<class T>
++    struct Com {
++      T *p = nullptr;
++      ~Com() {
++        if (p) {
++          p->Release();
++        }
++      }
++      T **operator&() {
++        return &p;
++      }
++      T *operator->() const {
++        return p;
++      }
++    };
++
++    struct Clip {
++      bool open = false;
++      Clip() {
++        for (int i = 0; i < 10 && !open; ++i) {
++          open = OpenClipboard(nullptr);
++          if (!open) {
++            Sleep(20);
++          }
++        }
++      }
++      ~Clip() {
++        if (open) {
++          CloseClipboard();
++        }
++      }
++    };
++
++    std::vector<unsigned char> stream_bytes(IStream *stream) {
++      std::vector<unsigned char> out;
++      HGLOBAL h = nullptr;
++      if (FAILED(GetHGlobalFromStream(stream, &h))) {
++        return out;
++      }
++      STATSTG st {};
++      if (FAILED(stream->Stat(&st, STATFLAG_NONAME))) {
++        return out;
++      }
++      auto *data = static_cast<unsigned char *>(GlobalLock(h));
++      if (data) {
++        out.assign(data, data + st.cbSize.QuadPart);
++        GlobalUnlock(h);
++      }
++      return out;
++    }
++
++    std::optional<std::vector<unsigned char>> png_from_hbitmap(HBITMAP bmp) {
++      Com<IWICImagingFactory> f;
++      if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) {
++        return std::nullopt;
++      }
++      Com<IWICBitmap> wic;
++      if (FAILED(f->CreateBitmapFromHBITMAP(bmp, nullptr, WICBitmapIgnoreAlpha, &wic))) {
++        return std::nullopt;
++      }
++      Com<IStream> stream;
++      if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
++        return std::nullopt;
++      }
++      Com<IWICBitmapEncoder> enc;
++      Com<IWICBitmapFrameEncode> frame;
++      if (FAILED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) || FAILED(enc->Initialize(stream.p, WICBitmapEncoderNoCache)) ||
++          FAILED(enc->CreateNewFrame(&frame, nullptr)) || FAILED(frame->Initialize(nullptr)) || FAILED(frame->WriteSource(wic.p, nullptr)) ||
++          FAILED(frame->Commit()) || FAILED(enc->Commit())) {
++        return std::nullopt;
++      }
++      return stream_bytes(stream.p);
++    }
++
++    /// Decode PNG to top-down 32bpp BGRA. Returns width/height via out params.
++    bool decode_png(const std::vector<unsigned char> &png, UINT &w, UINT &h, std::vector<unsigned char> &bgra) {
++      Com<IWICImagingFactory> f;
++      if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) {
++        return false;
++      }
++      Com<IWICStream> s;
++      if (FAILED(f->CreateStream(&s)) || FAILED(s->InitializeFromMemory(const_cast<BYTE *>(png.data()), static_cast<DWORD>(png.size())))) {
++        return false;
++      }
++      Com<IWICBitmapDecoder> dec;
++      Com<IWICBitmapFrameDecode> frame;
++      Com<IWICFormatConverter> conv;
++      if (FAILED(f->CreateDecoderFromStream(s.p, nullptr, WICDecodeMetadataCacheOnDemand, &dec)) || FAILED(dec->GetFrame(0, &frame)) ||
++          FAILED(f->CreateFormatConverter(&conv)) ||
++          FAILED(conv->Initialize(frame.p, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
++          FAILED(conv->GetSize(&w, &h)) || w == 0 || h == 0) {
++        return false;
++      }
++      bgra.resize(static_cast<size_t>(w) * h * 4);
++      return SUCCEEDED(conv->CopyPixels(nullptr, w * 4, static_cast<UINT>(bgra.size()), bgra.data()));
++    }
++
++    HGLOBAL global_copy(const void *data, size_t n) {
++      HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
++      if (!g) {
++        return nullptr;
++      }
++      void *p = GlobalLock(g);
++      std::memcpy(p, data, n);
++      GlobalUnlock(g);
++      return g;
++    }
++
++    /// Run on a fresh STA thread: clipboard + WIC need an initialized COM apartment we own.
++    template<class F>
++    auto on_sta(F f) -> decltype(f()) {
++      decltype(f()) result {};
++      std::thread t([&] {
++        bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
++        result = f();
++        if (co) {
++          CoUninitialize();
++        }
++      });
++      t.join();
++      return result;
++    }
++
++    class WinClipboardImage: public ClipboardImagePlatform {
++    public:
++      std::optional<std::vector<unsigned char>> get_png() override {
++        return on_sta([]() -> std::optional<std::vector<unsigned char>> {
++          Clip clip;
++          if (!clip.open) {
++            return std::nullopt;
++          }
++          UINT png_fmt = RegisterClipboardFormatW(L"PNG");
++          if (png_fmt && IsClipboardFormatAvailable(png_fmt)) {
++            if (HANDLE h = GetClipboardData(png_fmt)) {
++              auto *p = static_cast<unsigned char *>(GlobalLock(h));
++              if (p) {
++                std::vector<unsigned char> out(p, p + GlobalSize(h));
++                GlobalUnlock(h);
++                return out;
++              }
++            }
++          }
++          if (IsClipboardFormatAvailable(CF_BITMAP)) {
++            if (auto bmp = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP))) {
++              return png_from_hbitmap(bmp);
++            }
++          }
++          return std::nullopt;
++        });
++      }
++
++      bool set_png(const std::vector<unsigned char> &png) override {
++        return on_sta([&png]() -> bool {
++          UINT w = 0, h = 0;
++          std::vector<unsigned char> bgra;
++          if (!decode_png(png, w, h, bgra)) {
++            return false;
++          }
++          // CF_DIB: BITMAPINFOHEADER + bottom-up 32bpp rows.
++          BITMAPINFOHEADER bih {};
++          bih.biSize = sizeof(bih);
++          bih.biWidth = static_cast<LONG>(w);
++          bih.biHeight = static_cast<LONG>(h);
++          bih.biPlanes = 1;
++          bih.biBitCount = 32;
++          bih.biCompression = BI_RGB;
++          size_t row = static_cast<size_t>(w) * 4;
++          std::vector<unsigned char> dib(sizeof(bih) + row * h);
++          std::memcpy(dib.data(), &bih, sizeof(bih));
++          for (UINT y = 0; y < h; ++y) {
++            std::memcpy(dib.data() + sizeof(bih) + (h - 1 - y) * row, bgra.data() + y * row, row);
++          }
++          Clip clip;
++          if (!clip.open || !EmptyClipboard()) {
++            return false;
++          }
++          bool ok = false;
++          if (HGLOBAL g = global_copy(dib.data(), dib.size())) {
++            if (SetClipboardData(CF_DIB, g)) {
++              ok = true;
++            } else {
++              GlobalFree(g);
++            }
++          }
++          UINT png_fmt = RegisterClipboardFormatW(L"PNG");
++          if (png_fmt) {
++            if (HGLOBAL g = global_copy(png.data(), png.size())) {
++              if (!SetClipboardData(png_fmt, g)) {
++                GlobalFree(g);
++              }
++            }
++          }
++          return ok;
++        });
++      }
++    };
++  }  // namespace
++
++  std::shared_ptr<ClipboardImagePlatform> make_platform_clipboard_image() {
++    return std::make_shared<WinClipboardImage>();
++  }
++}  // namespace orbit
+diff --git a/tests/unit/test_clipboard_image.cpp b/tests/unit/test_clipboard_image.cpp
+new file mode 100644
+index 00000000..cb47525a
+--- /dev/null
++++ b/tests/unit/test_clipboard_image.cpp
+@@ -0,0 +1,106 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_clipboard_image.cpp
++ * @brief Test src/orbit/clipboard_image.* with a fake clipboard.
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/clipboard_image.h>
++
++namespace {
++  struct FakeClip: orbit::ClipboardImagePlatform {
++    std::optional<std::vector<unsigned char>> current;
++    std::vector<unsigned char> written;
++    bool ok = true;
++
++    std::optional<std::vector<unsigned char>> get_png() override {
++      return current;
++    }
++
++    bool set_png(const std::vector<unsigned char> &png) override {
++      written = png;
++      return ok;
++    }
++  };
++
++  crypto::named_cert_t cert_with(crypto::PERM perm) {
++    crypto::named_cert_t c {};
++    c.name = "Poco F6";
++    c.uuid = "u1";
++    c.perm = perm;
++    return c;
++  }
++
++  const auto kBoth = static_cast<crypto::PERM>(static_cast<uint32_t>(crypto::PERM::clipboard_read) | static_cast<uint32_t>(crypto::PERM::clipboard_set));
++}  // namespace
++
++TEST(ClipboardImage, Base64RoundTrip) {
++  for (std::vector<unsigned char> v : {std::vector<unsigned char> {1}, {1, 2}, {1, 2, 3}, {0, 255, 128, 7, 9}}) {
++    auto d = orbit::base64_decode(orbit::base64_encode(v));
++    ASSERT_TRUE(d.has_value());
++    EXPECT_EQ(*d, v);
++  }
++  EXPECT_FALSE(orbit::base64_decode("abc").has_value());
++}
++
++TEST(ClipboardImage, EmptyIs204) {
++  FakeClip p;
++  auto c = cert_with(kBoth);
++  EXPECT_EQ(orbit::clipboard_image_get_reply(&c, p).status, 204);
++}
++
++TEST(ClipboardImage, RoundTripPng) {
++  FakeClip p;
++  auto c = cert_with(kBoth);
++  p.current = std::vector<unsigned char> {0x89, 'P', 'N', 'G', 1, 2, 3};
++  auto r = orbit::clipboard_image_get_reply(&c, p);
++  ASSERT_EQ(r.status, 200);
++  auto set = orbit::clipboard_image_set_reply(&c, p, r.body);
++  EXPECT_EQ(set.status, 200);
++  EXPECT_EQ(p.written, *p.current);
++}
++
++TEST(ClipboardImage, RejectsOver10MB) {
++  FakeClip p;
++  auto c = cert_with(kBoth);
++  p.current = std::vector<unsigned char>(orbit::kMaxClipboardImageBytes + 1, 7);
++  EXPECT_EQ(orbit::clipboard_image_get_reply(&c, p).status, 413);
++  std::string body = std::string(R"({"png":")") + orbit::base64_encode(*p.current) + "\"}";
++  EXPECT_EQ(orbit::clipboard_image_set_reply(&c, p, body).status, 413);
++  EXPECT_TRUE(p.written.empty());
++}
++
++TEST(ClipboardImage, BadBodyIs400) {
++  FakeClip p;
++  auto c = cert_with(kBoth);
++  EXPECT_EQ(orbit::clipboard_image_set_reply(&c, p, "nope").status, 400);
++  EXPECT_EQ(orbit::clipboard_image_set_reply(&c, p, R"({"png":"abc"})").status, 400);
++}
++
++TEST(ClipboardImage, PermsChecked) {
++  FakeClip p;
++  p.current = std::vector<unsigned char> {1, 2, 3};
++  auto none = cert_with(crypto::PERM::view);
++  EXPECT_EQ(orbit::clipboard_image_get_reply(&none, p).status, 403);
++  EXPECT_EQ(orbit::clipboard_image_set_reply(&none, p, R"({"png":"AQID"})").status, 403);
++  EXPECT_EQ(orbit::clipboard_image_get_reply(nullptr, p).status, 401);
++  auto read_only = cert_with(crypto::PERM::clipboard_read);
++  EXPECT_EQ(orbit::clipboard_image_get_reply(&read_only, p).status, 200);
++  EXPECT_EQ(orbit::clipboard_image_set_reply(&read_only, p, R"({"png":"AQID"})").status, 403);
++}
+-- 
+2.55.0.windows.5
+

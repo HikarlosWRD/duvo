@@ -1,0 +1,14 @@
+Duvo - Copyright (C) 2026 Duvo contributors. Licensed under the GNU GPL v3 or later (see LICENSE).
+
+Duvo includes or builds on the following projects. Full license texts are in docs/licenses/.
+
+- Apollo / Sunshine (GPL-3.0): the Windows host is a patch series over Apollo (base commit adc5c5a0,
+  https://github.com/ClassicOldSong/Apollo), itself a fork of LizardByte/Sunshine. Source for the host:
+  that repository plus tools/host/patches/duvo/ in this one.
+- moonlight-common-c (GPL-3.0), https://github.com/moonlight-stream/moonlight-common-c (git submodule).
+- OpenSSL (Apache-2.0) and Opus (BSD-3-Clause), prebuilt for Android under android/app/src/main/cpp/third_party.
+- scrcpy (Apache-2.0) and adb (Android platform-tools, Apache-2.0): used by reverse mode; not bundled in the
+  repository, fetched from their official releases by the installer.
+- ViGEmBus (BSD-3-Clause, nefarius) and nefcon (BSD-3-Clause): virtual gamepad driver and installer helper.
+- SudoVDA (virtual display driver, distributed with Apollo): used by Monitor mode; installed from Apollo's release.
+- IBM Plex fonts (SIL OFL 1.1).

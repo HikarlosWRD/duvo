@@ -1,0 +1,68 @@
+From f6504e2cacbfc4ece66d6241999041ffbacd6792 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:44:11 -0300
+Subject: [PATCH 10/28] feat(host): enable input-only mode by default
+
+The Orbit phone remote control uses Apollo's input-only session
+(appuuid REMOTE_INPUT_UUID), which nvhttp only honours with
+enable_input_only_mode. Default it to true in config.cpp and in the web
+UI's defaults (the UI drops values equal to its own defaults, so leaving
+"disabled" there would make it impossible to save the option off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.cpp                           | 2 +-
+ src_assets/common/assets/web/config.html | 2 +-
+ tests/unit/test_orbit_config.cpp         | 6 ++++++
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/config.cpp b/src/config.cpp
+index 9fcb81b5..a7627b06 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -575,7 +575,7 @@ namespace config {
+     true,  // always send scancodes
+     true,  // high resolution scrolling
+     true,  // native pen/touch support
+-    false, // enable input only mode
++    true,  // enable input only mode // ORBIT: was false (the phone remote control uses the input-only session)
+     true, // forward_rumble
+   };
+ 
+diff --git a/src_assets/common/assets/web/config.html b/src_assets/common/assets/web/config.html
+index 7477aee8..24efd6c2 100644
+--- a/src_assets/common/assets/web/config.html
++++ b/src_assets/common/assets/web/config.html
+@@ -177,7 +177,7 @@
+               "mouse": "enabled",
+               "high_resolution_scrolling": "enabled",
+               "native_pen_touch": "enabled",
+-              "enable_input_only_mode": "disabled",
++              "enable_input_only_mode": "enabled",  // ORBIT: input-only on by default (matches config.cpp)
+               "forward_rumble": "enabled",
+               "keybindings": "[0x10,0xA0,0x11,0xA2,0x12,0xA4]",  // todo: add this to UI
+             },
+diff --git a/tests/unit/test_orbit_config.cpp b/tests/unit/test_orbit_config.cpp
+index 0dbbb056..d1617161 100644
+--- a/tests/unit/test_orbit_config.cpp
++++ b/tests/unit/test_orbit_config.cpp
+@@ -21,6 +21,7 @@
+  */
+ #include "../tests_common.h"
+ 
++#include <src/config.h>
+ #include <src/orbit/orbit_config.h>
+ 
+ TEST(OrbitConfig, DefaultPort) {
+@@ -30,3 +31,8 @@ TEST(OrbitConfig, DefaultPort) {
+ TEST(OrbitConfig, ServiceName) {
+   EXPECT_STREQ(orbit::kMdnsService, "_orbit._tcp");
+ }
++
++TEST(OrbitConfig, InputOnlyModeOnByDefault) {
++  // The phone remote control uses the input-only session (appuuid REMOTE_INPUT_UUID).
++  EXPECT_TRUE(config::input.enable_input_only_mode);
++}
+-- 
+2.55.0.windows.5
+

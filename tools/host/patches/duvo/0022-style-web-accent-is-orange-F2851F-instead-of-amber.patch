@@ -1,0 +1,110 @@
+From 43b183b013b90107a64c8d859ca2b80380bee18c Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:23:34 -0300
+Subject: [PATCH 22/28] style(web): accent is orange (#F2851F) instead of amber
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../assets/web/public/assets/css/duvo.css     | 42 +++++++++----------
+ .../common/assets/web/public/images/duvo.svg  |  2 +-
+ 2 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/src_assets/common/assets/web/public/assets/css/duvo.css b/src_assets/common/assets/web/public/assets/css/duvo.css
+index 66bbe871..573779f9 100644
+--- a/src_assets/common/assets/web/public/assets/css/duvo.css
++++ b/src_assets/common/assets/web/public/assets/css/duvo.css
+@@ -11,10 +11,10 @@ html:root {
+   --bs-border-radius: 0.75rem;
+   --bs-border-radius-lg: 1.25rem;
+   --bs-border-radius-sm: 0.5rem;
+-  --bs-primary: #f5a524;
+-  --bs-primary-rgb: 245, 165, 36;
+-  --bs-link-color-rgb: 245, 165, 36;
+-  --bs-link-hover-color-rgb: 255, 190, 80;
++  --bs-primary: #f2851f;
++  --bs-primary-rgb: 242, 133, 31;
++  --bs-link-color-rgb: 242, 133, 31;
++  --bs-link-hover-color-rgb: 255, 160, 70;
+ }
+ 
+ html[data-bs-theme=dark] {
+@@ -31,9 +31,9 @@ html[data-bs-theme=dark] {
+   --bs-card-bg: #16171a;
+   --bs-success: #5bcb8a;
+   --bs-success-rgb: 91, 203, 138;
+-  --bs-primary-text-emphasis: #f5a524;
+-  --bs-primary-bg-subtle: #3a2a08;
+-  --bs-primary-border-subtle: #6b4a10;
++  --bs-primary-text-emphasis: #f2851f;
++  --bs-primary-bg-subtle: #3d2108;
++  --bs-primary-border-subtle: #7a4310;
+ }
+ 
+ html[data-bs-theme=light] {
+@@ -49,9 +49,9 @@ html[data-bs-theme=light] {
+   --bs-card-bg: #ffffff;
+   --bs-success: #1e7a44;
+   --bs-success-rgb: 30, 122, 68;
+-  --bs-primary-text-emphasis: #8a5200;
+-  --bs-primary-bg-subtle: #ffe9c2;
+-  --bs-primary-border-subtle: #f5c777;
++  --bs-primary-text-emphasis: #9a4d00;
++  --bs-primary-bg-subtle: #ffe3c9;
++  --bs-primary-border-subtle: #f5b97d;
+   --bs-link-color-rgb: 138, 82, 0;
+   --bs-link-hover-color-rgb: 100, 60, 0;
+ }
+@@ -66,17 +66,17 @@ html h1, html h2, html h3, html h4, html h5, html h6 { font-weight: 600; letter-
+ /* The one amber action: solid buttons use the accent with dark text, in both themes. */
+ html .btn-primary, html .btn-success {
+   --bs-btn-color: #1a1204;
+-  --bs-btn-bg: #f5a524;
+-  --bs-btn-border-color: #f5a524;
++  --bs-btn-bg: #f2851f;
++  --bs-btn-border-color: #f2851f;
+   --bs-btn-hover-color: #1a1204;
+-  --bs-btn-hover-bg: #ffb64a;
+-  --bs-btn-hover-border-color: #ffb64a;
++  --bs-btn-hover-bg: #ff9a3c;
++  --bs-btn-hover-border-color: #ff9a3c;
+   --bs-btn-active-color: #1a1204;
+-  --bs-btn-active-bg: #e6961a;
+-  --bs-btn-active-border-color: #e6961a;
++  --bs-btn-active-bg: #d9720f;
++  --bs-btn-active-border-color: #d9720f;
+   --bs-btn-disabled-color: #1a1204;
+-  --bs-btn-disabled-bg: #f5a524;
+-  --bs-btn-disabled-border-color: #f5a524;
++  --bs-btn-disabled-bg: #f2851f;
++  --bs-btn-disabled-border-color: #f2851f;
+   font-weight: 600;
+ }
+ 
+@@ -104,10 +104,10 @@ html .form-control, html .form-select {
+   border-color: var(--bs-border-color);
+ }
+ html .form-control:focus, html .form-select:focus {
+-  border-color: #f5a524;
+-  box-shadow: 0 0 0 0.2rem rgba(245, 165, 36, 0.2);
++  border-color: #f2851f;
++  box-shadow: 0 0 0 0.2rem rgba(242, 133, 31, 0.2);
+ }
+-html .form-check-input:checked { background-color: #f5a524; border-color: #f5a524; }
++html .form-check-input:checked { background-color: #f2851f; border-color: #f2851f; }
+ 
+ html .navbar { background-color: var(--bs-body-bg) !important; border-bottom: 1px solid var(--bs-border-color); }
+ html .navbar-brand { display: flex; align-items: center; gap: 0.6rem; font-weight: 600; }
+diff --git a/src_assets/common/assets/web/public/images/duvo.svg b/src_assets/common/assets/web/public/images/duvo.svg
+index e2b4e81f..4d1e9f85 100644
+--- a/src_assets/common/assets/web/public/images/duvo.svg
++++ b/src_assets/common/assets/web/public/images/duvo.svg
+@@ -2,5 +2,5 @@
+   <rect x="0.75" y="0.75" width="106.5" height="106.5" rx="26" fill="#1b1c20"/>
+   <rect x="20" y="28" width="58" height="40" rx="7" fill="none" stroke="#ecedef" stroke-width="6"/>
+   <path d="M36 80h26" fill="none" stroke="#ecedef" stroke-width="6" stroke-linecap="round"/>
+-  <rect x="60" y="42" width="28" height="46" rx="8" fill="#f5a524" stroke="#1b1c20" stroke-width="5" paint-order="stroke"/>
++  <rect x="60" y="42" width="28" height="46" rx="8" fill="#f2851f" stroke="#1b1c20" stroke-width="5" paint-order="stroke"/>
+ </svg>
+-- 
+2.55.0.windows.5
+

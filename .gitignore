@@ -1,0 +1,17 @@
+# Host (Windows) build output; host/ stays ignored until it becomes a submodule
+/host/
+/host/build/
+
+# Android build output
+android/**/build/
+.gradle/
+local.properties
+*.apk
+*.keystore
+
+# Local tooling scratch
+.superpowers/
+
+# CMake/NDK intermediates
+android/**/.cxx/
+android/.kotlin/

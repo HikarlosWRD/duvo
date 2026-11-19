@@ -1,0 +1,213 @@
+From dfa6b9d94b93bbe9ccc9618bd0d4bd170fe80128 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:21:48 -0300
+Subject: [PATCH 12/28] fix(host): send unicode text as down/up per UTF-16 unit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake |  2 ++
+ src/orbit/unicode_events.cpp           | 36 +++++++++++++++++++++
+ src/orbit/unicode_events.h             | 44 ++++++++++++++++++++++++++
+ src/platform/windows/input.cpp         | 20 ++++--------
+ tests/unit/test_orbit_unicode.cpp      | 42 ++++++++++++++++++++++++
+ 5 files changed, 131 insertions(+), 13 deletions(-)
+ create mode 100644 src/orbit/unicode_events.cpp
+ create mode 100644 src/orbit/unicode_events.h
+ create mode 100644 tests/unit/test_orbit_unicode.cpp
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index a3d5ff45..eb1aa751 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -114,6 +114,8 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/orbit/pair_service.h"
+         "${CMAKE_SOURCE_DIR}/src/orbit/pair_qr.cpp"
+         "${CMAKE_SOURCE_DIR}/src/orbit/pair_qr.h"
++        "${CMAKE_SOURCE_DIR}/src/orbit/unicode_events.cpp"
++        "${CMAKE_SOURCE_DIR}/src/orbit/unicode_events.h"
+         "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+         "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+diff --git a/src/orbit/unicode_events.cpp b/src/orbit/unicode_events.cpp
+new file mode 100644
+index 00000000..f362c7fd
+--- /dev/null
++++ b/src/orbit/unicode_events.cpp
+@@ -0,0 +1,36 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/unicode_events.cpp
++ */
++#include "unicode_events.h"
++
++namespace orbit {
++  std::vector<UnicodeKeyEvent> unicode_key_events(const std::uint16_t *units, int count) {
++    std::vector<UnicodeKeyEvent> out;
++    if (!units || count <= 0) {
++      return out;
++    }
++    out.reserve(static_cast<size_t>(count) * 2);
++    for (int i = 0; i < count; i++) {
++      out.push_back({units[i], false});
++      out.push_back({units[i], true});
++    }
++    return out;
++  }
++}  // namespace orbit
+diff --git a/src/orbit/unicode_events.h b/src/orbit/unicode_events.h
+new file mode 100644
+index 00000000..e469c7d0
+--- /dev/null
++++ b/src/orbit/unicode_events.h
+@@ -0,0 +1,44 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file src/orbit/unicode_events.h
++ * @brief Ordering of KEYEVENTF_UNICODE key events (pure, testable).
++ */
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace orbit {
++  struct UnicodeKeyEvent {
++    std::uint16_t unit;  ///< UTF-16 code unit (goes in INPUT.ki.wScan)
++    bool up;
++
++    bool operator==(const UnicodeKeyEvent &o) const {
++      return unit == o.unit && up == o.up;
++    }
++  };
++
++  /**
++   * @brief Build the event sequence for a UTF-16 string: each code unit is sent as down immediately
++   * followed by up, in text order. Surrogate pairs are sent as two consecutive down/up pairs
++   * (high then low), which Windows recombines. Sending all downs first breaks text order
++   * (repeats of the last char, as seen with spaces).
++   */
++  std::vector<UnicodeKeyEvent> unicode_key_events(const std::uint16_t *units, int count);
++}  // namespace orbit
+diff --git a/src/platform/windows/input.cpp b/src/platform/windows/input.cpp
+index 81bb72ec..9de9adb0 100644
+--- a/src/platform/windows/input.cpp
++++ b/src/platform/windows/input.cpp
+@@ -20,6 +20,7 @@
+ #include "src/config.h"
+ #include "src/globals.h"
+ #include "src/logging.h"
++#include "src/orbit/unicode_events.h"
+ #include "src/platform/common.h"
+ 
+ #ifdef __MINGW32__
+@@ -1153,21 +1154,14 @@ namespace platf {
+       return;
+     }
+ 
+-    // Send all key down events
+-    for (int i = 0; i < chars; i++) {
++    // ORBIT: down+up por unidade UTF-16, na ordem do texto (todos os downs e depois todos os ups
++    // repetia o ultimo caractere apos o primeiro espaco).
++    static_assert(sizeof(WCHAR) == sizeof(uint16_t));
++    for (const auto &ev : orbit::unicode_key_events((const uint16_t *) wide, chars)) {
+       INPUT input {};
+       input.type = INPUT_KEYBOARD;
+-      input.ki.wScan = wide[i];
+-      input.ki.dwFlags = KEYEVENTF_UNICODE;
+-      send_input(input);
+-    }
+-
+-    // Send all key up events
+-    for (int i = 0; i < chars; i++) {
+-      INPUT input {};
+-      input.type = INPUT_KEYBOARD;
+-      input.ki.wScan = wide[i];
+-      input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
++      input.ki.wScan = ev.unit;
++      input.ki.dwFlags = KEYEVENTF_UNICODE | (ev.up ? KEYEVENTF_KEYUP : 0);
+       send_input(input);
+     }
+   }
+diff --git a/tests/unit/test_orbit_unicode.cpp b/tests/unit/test_orbit_unicode.cpp
+new file mode 100644
+index 00000000..c274a8c1
+--- /dev/null
++++ b/tests/unit/test_orbit_unicode.cpp
+@@ -0,0 +1,42 @@
++/*
++ * Orbit - game streaming host (fork of Apollo/Sunshine).
++ * Copyright (C) 2026 Orbit contributors.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++/**
++ * @file tests/unit/test_orbit_unicode.cpp
++ * @brief Test src/orbit/unicode_events.h
++ */
++#include "../tests_common.h"
++
++#include <src/orbit/unicode_events.h>
++
++TEST(OrbitUnicode, DownUpPerUnitInOrder) {
++  const std::uint16_t t[] = {'a', ' ', 'b'};
++  auto ev = orbit::unicode_key_events(t, 3);
++  std::vector<orbit::UnicodeKeyEvent> want = {{'a', false}, {'a', true}, {' ', false}, {' ', true}, {'b', false}, {'b', true}};
++  EXPECT_EQ(ev, want);
++}
++
++TEST(OrbitUnicode, SurrogatePairKeepsHighThenLow) {
++  const std::uint16_t t[] = {0xD83D, 0xDE00};
++  auto ev = orbit::unicode_key_events(t, 2);
++  std::vector<orbit::UnicodeKeyEvent> want = {{0xD83D, false}, {0xD83D, true}, {0xDE00, false}, {0xDE00, true}};
++  EXPECT_EQ(ev, want);
++}
++
++TEST(OrbitUnicode, EmptyYieldsNothing) {
++  EXPECT_TRUE(orbit::unicode_key_events(nullptr, 0).empty());
++}
+-- 
+2.55.0.windows.5
+
