@@ -1,5 +1,6 @@
 ﻿# Duvo para Windows: icone na bandeja, janela de app com o painel (Aparelhos, QR, configuracoes) e o host em segundo plano.
 $ErrorActionPreference = 'Stop'
+trap { try { Add-Content (Join-Path $env:TEMP 'duvo-tray-crash.log') (($_ | Out-String)) } catch {}; break }
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
 $installed = Test-Path (Join-Path $PSScriptRoot 'sunshine.exe')   # instalado: tudo na mesma pasta; no repositorio: host\build
 $root   = if ($installed) { $PSScriptRoot } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
@@ -37,6 +38,13 @@ function Get-CertSpkiHash([string]$pem) {
 function Get-WinArgs { return "--app=$url --user-data-dir=`"$data`" --ignore-certificate-errors-spki-list=$(Get-CertSpkiHash (Get-CertPath)) --test-type --no-first-run --no-default-browser-check --disable-sync --disable-features=Translate,msEdgeSync,msEdgeSignInPrompt --lang=pt-BR --window-size=1280,820" }
 $edge   = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeCore' -Filter msedge.exe -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 
+function Write-DuvoLog($e) {
+    try {
+        $d = Join-Path $env:LOCALAPPDATA 'Duvo'
+        New-Item -ItemType Directory -Force $d | Out-Null
+        Add-Content (Join-Path $d 'tray.log') ("{0} {1}" -f (Get-Date -Format s), ($e | Out-String).Trim())
+    } catch {}
+}
 $mutex = New-Object System.Threading.Mutex($false, 'Local\DuvoTray')
 if (-not $mutex.WaitOne(0)) {   # ja esta aberto: so mostra a janela
     if ($edge) { Start-Process $edge (Get-WinArgs) }
@@ -126,5 +134,24 @@ $first = New-Object System.Windows.Forms.Timer
 $first.Interval = 45000
 $first.add_Tick({ $first.Stop(); Invoke-UpdateCheck $false })
 $first.Start()
-[System.Windows.Forms.Application]::Run()
-
+# Fechar a janela so fecha o painel: o Duvo continua na bandeja. Avisa uma vez a cada fechamento.
+$script:hadWindow = $false
+$winTimer = New-Object System.Windows.Forms.Timer
+$winTimer.Interval = 2000
+$winTimer.add_Tick({
+    try {
+        $open = @(Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'Duvo' }).Count -gt 0
+        if ($script:hadWindow -and -not $open) {
+            $tray.BalloonTipTitle = 'Duvo continua aberto'
+            $tray.BalloonTipText = 'Ele ficou na bandeja do Windows (perto do relogio). Clique no icone para abrir de novo.'
+            $tray.ShowBalloonTip(4000)
+        }
+        $script:hadWindow = $open
+    } catch { Write-DuvoLog $_ }
+})
+$winTimer.Start()
+# Um erro em qualquer evento nao pode derrubar o icone da bandeja: registra e volta ao laco de mensagens.
+$ErrorActionPreference = 'Continue'
+while ($true) {
+    try { [System.Windows.Forms.Application]::Run(); break } catch { Write-DuvoLog $_; Start-Sleep -Seconds 1 }
+}
