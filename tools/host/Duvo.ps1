@@ -1,19 +1,38 @@
 ﻿# Duvo para Windows: icone na bandeja, janela de app com o painel (Aparelhos, QR, configuracoes) e o host em segundo plano.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
-$root   = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$build  = Join-Path $root 'host\build'
+$installed = Test-Path (Join-Path $PSScriptRoot 'sunshine.exe')   # instalado: tudo na mesma pasta; no repositorio: host\build
+$root   = if ($installed) { $PSScriptRoot } else { (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
+$build  = if ($installed) { $PSScriptRoot } else { Join-Path $root 'host\build' }
 $conf   = 'duvo-pc\duvo.conf'
 $icon   = Join-Path $PSScriptRoot 'duvo.ico'
 $url    = 'https://localhost:40990/pin'
-$spki   = 'roWkxapWuI+P0ONlQR5JNugqKP9R1NaS7KkOPv9Yhro='   # chave publica do certificado do host (so este PC)
 $data   = Join-Path $env:LOCALAPPDATA 'Duvo\janela'
-$winArgs = "--app=$url --user-data-dir=`"$data`" --ignore-certificate-errors-spki-list=$spki --test-type --no-first-run --no-default-browser-check --disable-sync --disable-features=Translate,msEdgeSync,msEdgeSignInPrompt --lang=pt-BR --window-size=1280,820"
+$certRel = 'duvo-pc\cert.pem'   # gerado pelo host na primeira execucao; o hash e calculado por instalacao
+function Get-CertSpkiHash([string]$pem) {
+    for ($i = 0; $i -lt 40 -and -not (Test-Path $pem); $i++) { Start-Sleep -Milliseconds 500 }   # primeira execucao: o host ainda esta criando o certificado
+    $b64 = ((Get-Content $pem -Raw) -replace '-----[A-Z ]+-----','' -replace '\s','')
+    $der = [Convert]::FromBase64String($b64)
+    function Read-Tlv($d, [int]$pos) {   # returns tag, header length, content length
+        $tag = $d[$pos]; $l = $d[$pos+1]; $h = 2
+        if ($l -ge 0x80) { $n = $l - 0x80; $l = 0; for ($i=0; $i -lt $n; $i++) { $l = ($l -shl 8) + $d[$pos+2+$i] }; $h = 2 + $n }
+        return @($tag, $h, $l)
+    }
+    $c = Read-Tlv $der 0; $pos = $c[1]                  # Certificate
+    $t = Read-Tlv $der $pos; $pos += $t[1]              # TBSCertificate: walk its fields
+    $f = Read-Tlv $der $pos
+    if ($f[0] -eq 0xA0) { $pos += $f[1] + $f[2] }       # optional version
+    for ($i = 0; $i -lt 5; $i++) { $f = Read-Tlv $der $pos; $pos += $f[1] + $f[2] }   # serial, sigalg, issuer, validity, subject
+    $f = Read-Tlv $der $pos
+    $spki = $der[$pos..($pos + $f[1] + $f[2] - 1)]
+    [Convert]::ToBase64String([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$spki))
+}
+function Get-WinArgs { return "--app=$url --user-data-dir=`"$data`" --ignore-certificate-errors-spki-list=$(Get-CertSpkiHash (Join-Path $build $certRel)) --test-type --no-first-run --no-default-browser-check --disable-sync --disable-features=Translate,msEdgeSync,msEdgeSignInPrompt --lang=pt-BR --window-size=1280,820" }
 $edge   = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeCore' -Filter msedge.exe -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\DuvoTray')
 if (-not $mutex.WaitOne(0)) {   # ja esta aberto: so mostra a janela
-    if ($edge) { Start-Process $edge $winArgs }
+    if ($edge) { Start-Process $edge (Get-WinArgs) }
     return
 }
 
@@ -44,7 +63,7 @@ function Set-WindowIcon {   # titulo da janela e barra de tarefas: icone do Duvo
 function Focus-Window { Start-Sleep -Milliseconds 1800; try { [Microsoft.VisualBasic.Interaction]::AppActivate('Duvo') } catch {} }
 function Open-Window {
     if (-not $edge) { Start-Process $url; return }
-    Start-Process $edge $winArgs
+    Start-Process $edge (Get-WinArgs)
     Focus-Window
     Set-WindowIcon
 }

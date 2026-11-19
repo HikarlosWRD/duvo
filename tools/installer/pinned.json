@@ -1,0 +1,11 @@
+{
+  "downloads": [
+    { "name": "scrcpy-win64-v5.0.1.zip",
+      "url": "https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-win64-v5.0.1.zip",
+      "sha256": "b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5" }
+  ],
+  "vigembus": {
+    "url": "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe",
+    "sha256": "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a"
+  }
+}
