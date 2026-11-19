@@ -1,7 +1,7 @@
 From dda95aa27f4fec4a8a40fccbff3626a3f29195e8 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 07:50:47 -0300
-Subject: [PATCH 20/28] feat(orbit): reverse mode service (adb + scrcpy) with
+Subject: [PATCH 20/30] feat(orbit): reverse mode service (adb + scrcpy) with
  web UI card
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

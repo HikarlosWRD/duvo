@@ -1,7 +1,7 @@
 From 9e37654806367929308838d100cd6145fd983f83 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 09:38:01 -0300
-Subject: [PATCH 23/28] feat(web): Devices page as the home (QR on open),
+Subject: [PATCH 23/30] feat(web): Devices page as the home (QR on open),
  sidebar navigation, pt-BR default, index redirect
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

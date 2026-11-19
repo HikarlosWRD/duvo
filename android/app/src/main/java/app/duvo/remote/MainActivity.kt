@@ -99,12 +99,15 @@ class MainActivity : ComponentActivity(), VolumeKeyHost, GamepadEventHost {
             lastUsed = runCatching { discovery.lastUsed() }.getOrNull(),
         )
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (savedInstanceState == null) duvo.checkForUpdate()
         setContent {
             val appearance by duvo.appearance.collectAsState()
             app.duvo.remote.ui.theme.DuvoTheme(appearance) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val nav = rememberNavController()
                     val link by deepLinkPairing.collectAsState()
+                    val update by duvo.availableUpdate.collectAsState()
+                    update?.let { app.duvo.remote.update.UpdateDialog(it, duvo) }
                     // Any app or page can open duvo://pair: unlike the in-app scanner, ask before pairing.
                     link?.let { p ->
                         AlertDialog(

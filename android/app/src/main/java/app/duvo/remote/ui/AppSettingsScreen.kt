@@ -89,5 +89,24 @@ fun AppSettingsScreen(
                 SettingsRow("Sonda do decoder", subtitle = "O que este aparelho consegue decodificar", onClick = onProbe)
             }
         }
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionLabel("Sobre")
+            SettingsGroup {
+                SettingsRow("Atualizações", subtitle = "Versão $versionName. $updateStatus", onClick = {
+                    updateStatus = "Verificando..."
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { UpdateChecker.fetchLatest() }
+                        if (r == null) {
+                            updateStatus = "Não consegui verificar agora."
+                        } else if (UpdateChecker.isNewer(versionName, r.version)) {
+                            updateStatus = "Nova versão ${r.version} disponível."
+                            (ctx.applicationContext as app.duvo.remote.DuvoApp).availableUpdate.value = r
+                        } else {
+                            updateStatus = "Você está na versão mais recente."
+                        }
+                    }
+                })
+            }
+        }
     }
 }

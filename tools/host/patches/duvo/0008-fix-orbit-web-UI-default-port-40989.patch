@@ -1,7 +1,7 @@
 From b90a80004fc727202966c2f53c9c420cbf3e83d3 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 07:15:06 -0300
-Subject: [PATCH 08/28] fix(orbit): web UI default port 40989
+Subject: [PATCH 08/30] fix(orbit): web UI default port 40989
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

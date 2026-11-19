@@ -2,4 +2,5 @@
 <!-- Duvo (GPLv3): cache folder for images copied from the PC. -->
 <paths>
     <cache-path name="clipboard" path="clipboard/" />
+    <cache-path name="updates" path="updates/" />
 </paths>

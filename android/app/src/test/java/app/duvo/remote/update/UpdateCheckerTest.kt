@@ -33,6 +33,14 @@ class UpdateCheckerTest {
         assertFalse(UpdateChecker.isNewer("1.0", "1.0.0"))
     }
 
+    @Test fun findsHashInListing() {
+        val h = "a".repeat(64)
+        val l = "$h  app-release.apk\n" + "b".repeat(64) + " *other.zip\n"
+        assertEquals(h, UpdateChecker.expectedHash(l, "app-release.apk"))
+        assertEquals("b".repeat(64), UpdateChecker.expectedHash(l, "other.zip"))
+        assertNull(UpdateChecker.expectedHash(l, "missing.apk"))
+    }
+
     @Test fun parsesRelease() {
         val r = UpdateChecker.parseLatest(
             """{"tag_name":"v0.2.0","html_url":"https://github.com/x/y/releases/tag/v0.2.0",

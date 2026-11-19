@@ -1,0 +1,23 @@
+From 2645e440b9decb648ff2ce8de8ccb0eaca374421 Mon Sep 17 00:00:00 2001
+From: Duvo <duvo@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:54:50 -0300
+Subject: [PATCH 30/30] test: log text after rename
+
+---
+ tests/unit/test_power_api.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/unit/test_power_api.cpp b/tests/unit/test_power_api.cpp
+index 19366e95..25ece1b0 100644
+--- a/tests/unit/test_power_api.cpp
++++ b/tests/unit/test_power_api.cpp
+@@ -93,5 +93,5 @@ TEST(PowerApi, LogsDeviceName) {
+   auto c = cert_with(crypto::PERM::orbit_power, "TL10 da sala");
+   EXPECT_EQ(orbit::power_reply(&c, p, {{"action", "sleep"}}, sink(log)).status, 200);
+   ASSERT_EQ(log.size(), 1u);
+-  EXPECT_EQ(log[0], "[Orbit] power sleep pedido por TL10 da sala");
++  EXPECT_EQ(log[0], "[Duvo] power sleep pedido por TL10 da sala");
+ }
+-- 
+2.55.0.windows.5
+

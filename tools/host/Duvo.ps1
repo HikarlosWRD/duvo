@@ -8,7 +8,14 @@ $conf   = 'duvo-pc\duvo.conf'
 $icon   = Join-Path $PSScriptRoot 'duvo.ico'
 $url    = 'https://localhost:40990/pin'
 $data   = Join-Path $env:LOCALAPPDATA 'Duvo\janela'
-$certRel = 'duvo-pc\cert.pem'   # gerado pelo host na primeira execucao; o hash e calculado por instalacao
+function Get-CertPath {   # certificado do painel: o "cert =" do duvo.conf, ou o padrao do host (config\credentials\cacert.pem)
+    $c = Join-Path $build $conf
+    if (Test-Path $c) {
+        $m = Select-String -Path $c -Pattern '^\s*cert\s*=\s*(.+?)\s*$' | Select-Object -First 1
+        if ($m) { $v = $m.Matches[0].Groups[1].Value; return $(if ([IO.Path]::IsPathRooted($v)) { $v } else { Join-Path $build $v }) }
+    }
+    return (Join-Path $build 'config\credentials\cacert.pem')
+}
 function Get-CertSpkiHash([string]$pem) {
     for ($i = 0; $i -lt 40 -and -not (Test-Path $pem); $i++) { Start-Sleep -Milliseconds 500 }   # primeira execucao: o host ainda esta criando o certificado
     $b64 = ((Get-Content $pem -Raw) -replace '-----[A-Z ]+-----','' -replace '\s','')
@@ -27,7 +34,7 @@ function Get-CertSpkiHash([string]$pem) {
     $spki = $der[$pos..($pos + $f[1] + $f[2] - 1)]
     [Convert]::ToBase64String([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$spki))
 }
-function Get-WinArgs { return "--app=$url --user-data-dir=`"$data`" --ignore-certificate-errors-spki-list=$(Get-CertSpkiHash (Join-Path $build $certRel)) --test-type --no-first-run --no-default-browser-check --disable-sync --disable-features=Translate,msEdgeSync,msEdgeSignInPrompt --lang=pt-BR --window-size=1280,820" }
+function Get-WinArgs { return "--app=$url --user-data-dir=`"$data`" --ignore-certificate-errors-spki-list=$(Get-CertSpkiHash (Get-CertPath)) --test-type --no-first-run --no-default-browser-check --disable-sync --disable-features=Translate,msEdgeSync,msEdgeSignInPrompt --lang=pt-BR --window-size=1280,820" }
 $edge   = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeCore' -Filter msedge.exe -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\DuvoTray')
@@ -68,6 +75,29 @@ function Open-Window {
     Set-WindowIcon
 }
 
+. (Join-Path $PSScriptRoot 'Duvo-Update.ps1')
+$script:pendingUpdate = $null
+function Invoke-UpdateCheck([bool]$manual) {   # so instalado (version.txt): na pasta do repositorio nao atualiza sozinho
+    $cur = Get-InstalledVersion $build
+    if (-not $cur) { if ($manual) { [void][System.Windows.Forms.MessageBox]::Show('Esta copia do Duvo nao foi instalada pelo pacote; nao ha atualizacao automatica.', 'Duvo') }; return }
+    $r = Get-LatestRelease
+    if (-not $r) { if ($manual) { [void][System.Windows.Forms.MessageBox]::Show('Nao consegui verificar agora. Confira a internet e tente de novo.', 'Duvo') }; return }
+    if (-not (Test-VersionNewer $cur $r.Version)) { if ($manual) { [void][System.Windows.Forms.MessageBox]::Show("Voce ja esta na versao mais recente ($cur).", 'Duvo') }; return }
+    $skip = Join-Path $env:LOCALAPPDATA 'Duvo\update-skipped.txt'
+    if (-not $manual -and (Test-Path $skip) -and ((Get-Content $skip -Raw).Trim() -eq $r.Version)) { return }
+    $ans = [System.Windows.Forms.MessageBox]::Show("Duvo $($r.Version) esta disponivel (voce tem $cur).`n`nBaixar e atualizar agora? O pacote e verificado (SHA-256) antes de instalar e o Duvo reabre sozinho.", 'Atualizar o Duvo', 'YesNoCancel')
+    if ($ans -eq 'Yes') {
+        try {
+            Start-DuvoUpdate $r $build
+            $tray.Visible = $false
+            [System.Windows.Forms.Application]::Exit()
+            exit
+        } catch { [void][System.Windows.Forms.MessageBox]::Show("Nao foi possivel atualizar: $($_.Exception.Message)", 'Duvo') }
+    } elseif ($ans -eq 'Cancel') {
+        New-Item -ItemType Directory -Force (Split-Path $skip) | Out-Null
+        Set-Content $skip $r.Version -Encoding ASCII
+    }
+}
 Ensure-Conf
 Start-DuvoHost
 $tray = New-Object System.Windows.Forms.NotifyIcon
@@ -76,6 +106,7 @@ $tray.Text = 'Duvo'
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Abrir o Duvo', $null, { Open-Window })
 [void]$menu.Items.Add('Parear um celular', $null, { Open-Window })
+[void]$menu.Items.Add('Verificar atualizacao', $null, { Invoke-UpdateCheck $true })
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('Sair do Duvo', $null, {
     $tray.Visible = $false
@@ -87,5 +118,13 @@ $tray.add_DoubleClick({ Open-Window })
 $tray.Visible = $true
 Start-Sleep -Seconds 14   # o host leva alguns segundos para abrir as portas
 Open-Window
+$updTimer = New-Object System.Windows.Forms.Timer
+$updTimer.Interval = 6 * 60 * 60 * 1000
+$updTimer.add_Tick({ Invoke-UpdateCheck $false })
+$updTimer.Start()
+$first = New-Object System.Windows.Forms.Timer
+$first.Interval = 45000
+$first.add_Tick({ $first.Stop(); Invoke-UpdateCheck $false })
+$first.Start()
 [System.Windows.Forms.Application]::Run()
 

@@ -22,7 +22,7 @@ import java.net.URL
 import org.json.JSONObject
 
 /** The newest published release, as read from GitHub. */
-data class ReleaseInfo(val version: String, val pageUrl: String, val apkUrl: String?)
+data class ReleaseInfo(val version: String, val pageUrl: String, val apkUrl: String?, val sumsUrl: String? = null)
 
 /**
  * Looks for a newer Duvo release on GitHub. It only reads the public release list; installing stays with
@@ -36,14 +36,23 @@ object UpdateChecker {
         val tag = o.getString("tag_name").trim().removePrefix("v")
         val assets = o.optJSONArray("assets")
         var apk: String? = null
+        var sums: String? = null
         if (assets != null) for (i in 0 until assets.length()) {
             val a = assets.getJSONObject(i)
             if (a.optString("name").endsWith(".apk")) apk = a.optString("browser_download_url")
+            if (a.optString("name") == "SHA256SUMS.txt") sums = a.optString("browser_download_url")
         }
-        ReleaseInfo(tag, o.getString("html_url"), apk)
+        ReleaseInfo(tag, o.getString("html_url"), apk, sums)
     } catch (e: Exception) {
         null
     }
+
+    /** Finds [file] in a sha256sum listing ("<hash>  <name>" or "<hash> *<name>"); null when absent. */
+    fun expectedHash(listing: String, file: String): String? =
+        listing.lineSequence().map { it.trim() }.firstNotNullOfOrNull { line ->
+            val m = Regex("^([0-9a-fA-F]{64})\\s+\\*?(.+)$").find(line)
+            if (m != null && m.groupValues[2] == file) m.groupValues[1].lowercase() else null
+        }
 
     /** True when [candidate] ("0.2.0", "1.0") is a higher dotted number than [current]. Non-numeric parts count as 0. */
     fun isNewer(current: String, candidate: String): Boolean {

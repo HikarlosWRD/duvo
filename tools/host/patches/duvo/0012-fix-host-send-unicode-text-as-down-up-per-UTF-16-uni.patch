@@ -1,7 +1,7 @@
 From dfa6b9d94b93bbe9ccc9618bd0d4bd170fe80128 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 17:21:48 -0300
-Subject: [PATCH 12/28] fix(host): send unicode text as down/up per UTF-16 unit
+Subject: [PATCH 12/30] fix(host): send unicode text as down/up per UTF-16 unit
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

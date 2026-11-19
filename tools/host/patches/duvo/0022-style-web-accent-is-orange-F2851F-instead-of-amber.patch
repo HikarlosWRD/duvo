@@ -1,7 +1,7 @@
 From 43b183b013b90107a64c8d859ca2b80380bee18c Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 09:23:34 -0300
-Subject: [PATCH 22/28] style(web): accent is orange (#F2851F) instead of amber
+Subject: [PATCH 22/30] style(web): accent is orange (#F2851F) instead of amber
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---

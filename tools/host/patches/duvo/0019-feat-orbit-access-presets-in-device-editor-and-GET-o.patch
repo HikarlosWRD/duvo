@@ -1,7 +1,7 @@
 From 7dadf23dd5c30ce92d54b3b9b99964fea4298d95 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 07:42:18 -0300
-Subject: [PATCH 19/28] feat(orbit): access presets in device editor and GET
+Subject: [PATCH 19/30] feat(orbit): access presets in device editor and GET
  /orbit/access
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

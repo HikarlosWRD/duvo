@@ -19,6 +19,12 @@
 package app.duvo.remote
 
 import android.app.Application
+import app.duvo.remote.update.ReleaseInfo
+import app.duvo.remote.update.UpdateChecker
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import java.io.File
 import app.duvo.remote.discovery.AndroidNsdBrowser
 import app.duvo.remote.discovery.DiscoveryHolder
@@ -51,5 +57,26 @@ class DuvoApp : Application() {
     fun setAppearance(a: app.duvo.remote.ui.theme.Appearance) {
         app.duvo.remote.ui.theme.Appearance.save(this, a)
         appearance.value = a
+    }
+
+    /** A newer release found by [checkForUpdate]; shown as a dialog by MainActivity and in Configurações. */
+    val availableUpdate = MutableStateFlow<ReleaseInfo?>(null)
+
+    /** At most every 6 hours; silent when offline. */
+    fun checkForUpdate(force: Boolean = false) {
+        val sp = getSharedPreferences("duvo_update", MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        if (!force && now - sp.getLong("last_check", 0L) < 6 * 60 * 60 * 1000L) return
+        CoroutineScope(Dispatchers.IO).launch {
+            val r = UpdateChecker.fetchLatest() ?: return@launch
+            sp.edit().putLong("last_check", now).apply()
+            val current = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: return@launch
+            availableUpdate.value = if (UpdateChecker.isNewer(current, r.version) && sp.getString("skipped", "") != r.version) r else null
+        }
+    }
+
+    fun skipUpdate(version: String) {
+        getSharedPreferences("duvo_update", MODE_PRIVATE).edit().putString("skipped", version).apply()
+        availableUpdate.value = null
     }
 }

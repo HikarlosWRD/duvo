@@ -1,7 +1,7 @@
 From c8f2bcabb4d43265b41b1aae18fa8be856b10192 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Wed, 18 Nov 2026 17:44:10 -0300
-Subject: [PATCH 14/28] feat(orbit): window/power permissions, Controle preset,
+Subject: [PATCH 14/30] feat(orbit): window/power permissions, Controle preset,
  migration
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

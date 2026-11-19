@@ -1,7 +1,7 @@
 From 263b3ffe9a54d4ce18f25d3f38f55fec9d3de8e7 Mon Sep 17 00:00:00 2001
-From: Duvo <duvo@users.noreply.github.com>
+From: Orbit Dev <dev@orbit.invalid>
 Date: Thu, 19 Nov 2026 14:13:22 -0300
-Subject: [PATCH 25/28] feat(web): rename Apollo/Sunshine to Duvo everywhere
+Subject: [PATCH 25/30] feat(web): rename Apollo/Sunshine to Duvo everywhere
  visible, Duvo icons (tray, favicon, logo), centred login, sidebar padding
  only with navbar
 
